@@ -1,0 +1,3 @@
+// Windows resources for crux-gui.exe, compiled by build.rs.
+// The first icon in the file is the one Explorer shows.
+1 ICON "crux.ico"

@@ -1,0 +1,18 @@
+{
+ "format": "crux-sharpen",
+ "version": 1,
+ "k": 3.0,
+ "fwhm_scale": 4.0,
+ "multiple": 16,
+ "inputs": [
+  "asinh((v - sky) / (k * noise))",
+  "fwhm / fwhm_scale",
+  "sharpen (0 = correct only, 1 = also tighten)"
+ ],
+ "parameters": 1925601,
+ "iters": 15000,
+ "max_scale": 2.6,
+ "p_scale": 0.7,
+ "flux_weight": 0.2,
+ "model": "d2 (tools/ml/deconv.py): 21 ASI2600 master centres, denoised; random aberration kernels; truths downscaled up to 2.6x; flux-conservation term"
+}

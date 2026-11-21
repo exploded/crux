@@ -1,0 +1,14 @@
+{
+ "format": "crux-starless",
+ "version": 1,
+ "k": 3.0,
+ "fwhm_scale": 4.0,
+ "multiple": 32,
+ "inputs": [
+  "asinh((v - sky) / (k * noise))",
+  "fwhm / fwhm_scale"
+ ],
+ "parameters": 7759809,
+ "iters": 15000,
+ "model": "s1 (tools/ml/starless.py): classic-starless backgrounds of 21 ASI2600 masters, denoised; real star cutouts from the bundles; real stack noise passed through"
+}

@@ -1,0 +1,577 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>crux triage report</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface-1: #fcfcfb;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: rgba(11,11,11,0.10);
+  --line: #86b6ef;
+  --good: #0ca30c;
+  --warn: #fab219;
+  --reject: #d03b3b;
+  --accent: #2a78d6;
+  --chip: #f0efec;
+  --div-neg: #2a78d6;
+  --div-mid: #f0efec;
+  --div-pos: #e34948;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface-1: #1a1a19;
+    --text-primary: #f0efec;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255,255,255,0.10);
+    --line: #1c5cab;
+    --accent: #3987e5;
+    --chip: #262624;
+    --div-neg: #3987e5;
+    --div-mid: #383835;
+    --div-pos: #e66767;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface-1: #1a1a19;
+  --text-primary: #f0efec;
+  --text-secondary: #c3c2b7;
+  --text-muted: #898781;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --border: rgba(255,255,255,0.10);
+  --line: #1c5cab;
+  --accent: #3987e5;
+  --chip: #262624;
+  --div-neg: #3987e5;
+  --div-mid: #383835;
+  --div-pos: #e66767;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--text-primary);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  overflow-wrap: anywhere;
+}
+main { overflow-x: hidden; }
+main { max-width: 1280px; margin: 0 auto; padding: 32px 16px 64px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin-bottom: 24px; }
+h1 { font-size: 22px; font-weight: 600; margin: 0; }
+h2 { font-size: 17px; font-weight: 600; margin: 40px 0 4px; }
+h3 { font-size: 13px; font-weight: 600; margin: 0 0 8px; color: var(--text-secondary); }
+.sub { color: var(--text-secondary); }
+.muted { color: var(--text-muted); }
+.spacer { flex: 1; }
+button.theme {
+  background: var(--chip); color: var(--text-secondary); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer;
+}
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(150px, 100%), 1fr)); gap: 12px; margin-bottom: 24px; }
+.tile, .card {
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 16px;
+}
+.tile .label { color: var(--text-secondary); font-size: 12px; }
+.tile .value { font-size: 26px; font-weight: 600; margin-top: 2px; }
+.tile .hint { color: var(--text-muted); font-size: 12px; }
+.status { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.status svg { flex: none; }
+.notes { margin: 0; padding-left: 18px; color: var(--text-secondary); }
+.notes li { margin: 2px 0; }
+.filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 32px 0 0; position: sticky; top: 0; padding: 10px 0; background: var(--page); z-index: 5; }
+.filters .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.filters .seg button {
+  background: var(--surface-1); color: var(--text-secondary); border: 0; padding: 6px 12px; font: inherit; cursor: pointer;
+}
+.filters .seg button + button { border-left: 1px solid var(--border); }
+.filters .seg button[aria-pressed="true"] { background: var(--chip); color: var(--text-primary); font-weight: 600; }
+.filters label { color: var(--text-secondary); display: inline-flex; gap: 6px; align-items: center; margin-left: 8px; }
+.legend { display: flex; flex-wrap: wrap; gap: 16px; color: var(--text-secondary); font-size: 12px; margin-left: auto; }
+table { overflow-wrap: normal; }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); gap: 12px; margin-top: 12px; }
+.chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+.chart .axis text { fill: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.tablewrap { overflow-x: auto; margin-top: 12px; background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+th { color: var(--text-secondary); font-weight: 600; cursor: pointer; user-select: none; white-space: nowrap; position: relative; }
+th[aria-sort="ascending"]::after { content: " ↑"; }
+th[aria-sort="descending"]::after { content: " ↓"; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+td.nowrap { white-space: nowrap; }
+th.num { text-align: right; }
+tr:last-child td { border-bottom: 0; }
+tr.dim { display: none; }
+td.reasons { color: var(--text-secondary); min-width: 280px; }
+td.reasons div + div { margin-top: 2px; }
+td.reasons .note { color: var(--text-muted); }
+.badge { display: inline-block; font-size: 11px; color: var(--text-secondary); background: var(--chip); border-radius: 4px; padding: 0 6px; margin-left: 6px; }
+#tip {
+  position: fixed; pointer-events: none; z-index: 10; max-width: 360px; display: none;
+  background: var(--surface-1); color: var(--text-primary); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 12px; box-shadow: 0 6px 24px rgba(0,0,0,0.25); font-size: 12px;
+}
+#tip .v { font-size: 16px; font-weight: 600; }
+#tip .r { color: var(--text-secondary); margin-top: 4px; }
+.heat canvas { display: block; width: 100%; height: auto; border-radius: 6px; cursor: crosshair; }
+.heat .meta { color: var(--text-secondary); font-size: 12px; margin: 4px 0 8px; display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center; }
+.heat .scale { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.heat .scale .bar { flex: 1; height: 8px; border-radius: 4px; }
+.heat .edges { font-size: 12px; color: var(--text-secondary); margin-top: 6px; font-variant-numeric: tabular-nums; }
+details.frames { margin-top: 4px; }
+details.frames summary { cursor: pointer; color: var(--text-secondary); }
+details.frames div { font-size: 12px; margin: 2px 0; }
+footer { margin-top: 48px; color: var(--text-muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1 id="title">crux triage report</h1>
+    <span class="sub" id="root"></span>
+    <span class="spacer"></span>
+    <span class="muted" id="generated"></span>
+    <button class="theme" id="theme" type="button" aria-label="Switch light or dark theme">Theme: auto</button>
+  </header>
+  <section class="tiles" id="tiles"></section>
+  <section id="calib"></section>
+  <section id="calchecks"></section>
+  <div class="filters" role="toolbar" aria-label="Filter frames">
+    <div class="seg" id="gradeFilter">
+      <button type="button" data-f="all" aria-pressed="true">All frames</button>
+      <button type="button" data-f="flagged" aria-pressed="false">Warn and reject</button>
+      <button type="button" data-f="reject" aria-pressed="false">Reject</button>
+    </div>
+    <label><input type="checkbox" id="rejDir"> Only frames in reject folders</label>
+    <div class="legend" id="legend"></div>
+  </div>
+  <section id="nights"></section>
+  <footer id="footer"></footer>
+</main>
+<div id="tip" role="tooltip"></div>
+<script id="data" type="application/json">/*DATA*/</script>
+<script>
+(function () {
+  "use strict";
+  const D = JSON.parse(document.getElementById("data").textContent);
+  const NS = "http://www.w3.org/2000/svg";
+  const $ = (id) => document.getElementById(id);
+  const GRADES = { good: "Good", warn: "Warn", reject: "Reject" };
+
+  function h(tag, props, ...kids) {
+    const e = document.createElement(tag);
+    for (const [k, v] of Object.entries(props || {})) {
+      if (k === "class") e.className = v;
+      else if (k === "text") e.textContent = v;
+      else e.setAttribute(k, v);
+    }
+    for (const k of kids) if (k != null) e.append(k);
+    return e;
+  }
+  function s(tag, attrs, parent) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+
+  // Marker shapes carry the grade as well as colour: circle, triangle, cross.
+  function marker(g, x, y, r, parent) {
+    const fill = `var(--${g})`;
+    const common = { fill, stroke: "var(--surface-1)", "stroke-width": 2, "paint-order": "stroke" };
+    if (g === "good") return s("circle", { cx: x, cy: y, r, ...common }, parent);
+    if (g === "warn") {
+      const k = r * 1.25;
+      return s("path", { d: `M${x},${y - k}L${x + k},${y + k * 0.8}L${x - k},${y + k * 0.8}Z`, ...common }, parent);
+    }
+    const a = r * 1.15, b = r * 0.45;
+    const pts = [[-a, -a + b], [-a + b, -a], [0, -b], [a - b, -a], [a, -a + b], [b, 0], [a, a - b], [a - b, a], [0, b], [-a + b, a], [-a, a - b], [-b, 0]];
+    return s("path", { d: "M" + pts.map(([u, v]) => `${x + u},${y + v}`).join("L") + "Z", ...common }, parent);
+  }
+  function statusChip(g) {
+    const svg = s("svg", { width: 14, height: 14, viewBox: "0 0 14 14", "aria-hidden": "true" });
+    marker(g, 7, 7, 4.5, svg);
+    return h("span", { class: "status" }, svg, h("span", { text: GRADES[g] }));
+  }
+
+  // Theme toggle: auto → dark → light.
+  const themeBtn = $("theme");
+  const themes = ["auto", "dark", "light"];
+  let theme = "auto";
+  try { theme = localStorage.getItem("crux-theme") || "auto"; } catch (e) {}
+  function applyTheme() {
+    if (theme === "auto") document.documentElement.removeAttribute("data-theme");
+    else document.documentElement.setAttribute("data-theme", theme);
+    themeBtn.textContent = "Theme: " + theme;
+  }
+  themeBtn.addEventListener("click", () => {
+    theme = themes[(themes.indexOf(theme) + 1) % themes.length];
+    try { localStorage.setItem("crux-theme", theme); } catch (e) {}
+    applyTheme();
+  });
+  applyTheme();
+
+  // Header and tiles.
+  $("title").textContent = D.title;
+  $("root").textContent = D.root;
+  $("generated").textContent = "Generated " + D.generated;
+  document.title = D.title;
+  const all = D.nights.flatMap((n) => n.frames);
+  const count = (g) => all.filter((f) => f.grade === g).length;
+  const tiles = [
+    ["Lights graded", String(all.length), `${D.nights.length} nights`],
+    ["Good", String(count("good")), "keep"],
+    ["Warn", String(count("warn")), "needs checking"],
+    ["Reject", String(count("reject")), "suggested for BAD"],
+    ["Already in reject folders", String(all.filter((f) => f.inReject).length), `${all.filter((f) => f.inReject && f.grade !== "good").length} flagged by crux`],
+  ];
+  for (const [label, value, hint] of tiles) {
+    $("tiles").append(h("div", { class: "tile" }, h("div", { class: "label", text: label }), h("div", { class: "value", text: value }), h("div", { class: "hint", text: hint })));
+  }
+
+  // Calibration warnings.
+  const calib = $("calib");
+  const lists = [["Warnings", D.warnings], ["Missing calibration", D.missing], ["Calibration used", D.calibration]];
+  for (const [title, items] of lists) {
+    if (!items || !items.length) continue;
+    const ul = h("ul", { class: "notes" });
+    for (const t of items) ul.append(h("li", { text: t }));
+    calib.append(h("div", { class: "card", style: "margin-bottom:12px" }, h("h3", { text: title }), ul));
+  }
+
+  // Legend.
+  for (const g of ["good", "warn", "reject"]) $("legend").append(statusChip(g));
+
+  // Filters scope every chart and table.
+  let gradeF = "all", rejOnly = false;
+  function visible(f) {
+    if (rejOnly && !f.inReject) return false;
+    if (gradeF === "flagged") return f.grade !== "good";
+    if (gradeF === "reject") return f.grade === "reject";
+    return true;
+  }
+  const redraws = [];
+  function refresh() { for (const r of redraws) r(); }
+  for (const b of $("gradeFilter").querySelectorAll("button")) {
+    b.addEventListener("click", () => {
+      gradeF = b.dataset.f;
+      for (const o of $("gradeFilter").querySelectorAll("button")) o.setAttribute("aria-pressed", String(o === b));
+      refresh();
+    });
+  }
+  $("rejDir").addEventListener("change", (e) => { rejOnly = e.target.checked; refresh(); });
+
+  // Tooltip.
+  const tip = $("tip");
+  function showTip(f, label, value, ev) {
+    tip.replaceChildren(
+      h("div", { class: "v", text: value }),
+      h("div", { text: `${f.time} · ${f.object}` }),
+      h("div", {}, statusChip(f.grade), f.inReject ? h("span", { class: "badge", text: "in reject folder" }) : null),
+      ...f.reasons.slice(0, 4).map((r) => h("div", { class: "r", text: r }))
+    );
+    tip.style.display = "block";
+    const pad = 14, w = tip.offsetWidth, hgt = tip.offsetHeight;
+    let x = ev.clientX + pad, y = ev.clientY + pad;
+    if (x + w > window.innerWidth - 8) x = ev.clientX - w - pad;
+    if (y + hgt > window.innerHeight - 8) y = ev.clientY - hgt - pad;
+    tip.style.left = x + "px"; tip.style.top = y + "px";
+  }
+  function hideTip() { tip.style.display = "none"; }
+
+  function niceTicks(lo, hi, n) {
+    const span = hi - lo || 1;
+    const step0 = span / n, mag = Math.pow(10, Math.floor(Math.log10(step0)));
+    const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((x) => x >= step0) || 10 * mag;
+    const t = [];
+    for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) t.push(+v.toFixed(10));
+    return t;
+  }
+  function hhmm(min) {
+    const m = ((Math.round(min) + 12 * 60) % 1440 + 1440) % 1440;
+    return String(Math.floor(m / 60)).padStart(2, "0") + ":" + String(m % 60).padStart(2, "0");
+  }
+
+  // One chart: a single measure against local time. One axis, thin line, status markers.
+  function chart(card, frames, spec) {
+    const W = 420, H = 210, m = { l: 44, r: 12, t: 10, b: 26 };
+    const pts = frames.filter((f) => f[spec.key] != null);
+    card.append(h("h3", { text: spec.title }));
+    if (!pts.length) { card.append(h("div", { class: "muted", text: "No measurements" })); return; }
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `${spec.title} against time; values are in the table below` });
+    card.append(svg);
+    const xs = pts.map((f) => f.x), ys = pts.map((f) => f[spec.key]);
+    let x0 = Math.min(...xs), x1 = Math.max(...xs);
+    if (x1 - x0 < 30) { x0 -= 15; x1 += 15; }
+    let y0 = spec.min != null ? spec.min : Math.min(...ys), y1 = spec.max != null ? Math.max(spec.max, Math.max(...ys)) : Math.max(...ys);
+    if (spec.min == null) { const pad = (y1 - y0) * 0.1 || 0.5; y0 -= pad; y1 += pad; if (spec.floor0) y0 = Math.max(0, y0); }
+    const X = (v) => m.l + (v - x0) / (x1 - x0) * (W - m.l - m.r);
+    const Y = (v) => H - m.b - (v - y0) / (y1 - y0) * (H - m.t - m.b);
+    const ax = s("g", { class: "axis" }, svg);
+    for (const t of niceTicks(y0, y1, 4)) {
+      s("line", { x1: m.l, x2: W - m.r, y1: Y(t), y2: Y(t), stroke: "var(--grid)", "stroke-width": 1 }, ax);
+      const tx = s("text", { x: m.l - 6, y: Y(t) + 4, "text-anchor": "end" }, ax);
+      tx.textContent = spec.fmt(t);
+    }
+    s("line", { x1: m.l, x2: W - m.r, y1: H - m.b, y2: H - m.b, stroke: "var(--axis)", "stroke-width": 1 }, ax);
+    const step = (x1 - x0) > 480 ? 120 : 60;
+    for (let t = Math.ceil(x0 / step) * step; t <= x1; t += step) {
+      const tx = s("text", { x: X(t), y: H - 8, "text-anchor": "middle" }, ax);
+      tx.textContent = hhmm(t);
+    }
+    if (spec.ref != null) {
+      s("line", { x1: m.l, x2: W - m.r, y1: Y(spec.ref), y2: Y(spec.ref), stroke: "var(--axis)", "stroke-width": 1 }, ax);
+    }
+    const sorted = pts.slice().sort((a, b) => a.x - b.x);
+    s("path", { d: "M" + sorted.map((f) => `${X(f.x)},${Y(f[spec.key])}`).join("L"), fill: "none", stroke: "var(--line)", "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+    const marks = s("g", {}, svg);
+    const cross = s("line", { y1: m.t, y2: H - m.b, stroke: "var(--axis)", "stroke-width": 1, visibility: "hidden" }, svg);
+    function draw() {
+      marks.replaceChildren();
+      // Rejects drawn last so they sit on top.
+      for (const g of ["good", "warn", "reject"]) {
+        for (const f of sorted) if (f.grade === g) {
+          const mk = marker(g, X(f.x), Y(f[spec.key]), 4, marks);
+          if (!visible(f)) mk.setAttribute("opacity", "0.12");
+        }
+      }
+    }
+    draw();
+    redraws.push(draw);
+    // Crosshair snaps to the nearest frame in time; hit area is the whole plot.
+    const hit = s("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: "transparent" }, svg);
+    hit.addEventListener("pointermove", (ev) => {
+      const r = svg.getBoundingClientRect();
+      const vx = (ev.clientX - r.left) / r.width * W;
+      let best = null, bd = Infinity;
+      for (const f of sorted) { const d = Math.abs(X(f.x) - vx); if (d < bd) { bd = d; best = f; } }
+      if (!best) return;
+      cross.setAttribute("x1", X(best.x)); cross.setAttribute("x2", X(best.x)); cross.setAttribute("visibility", "visible");
+      showTip(best, spec.title, spec.tip(best[spec.key]), ev);
+    });
+    hit.addEventListener("pointerleave", () => { cross.setAttribute("visibility", "hidden"); hideTip(); });
+  }
+
+  const COLS = [
+    { k: "time", t: "Time" },
+    { k: "object", t: "Field" },
+    { k: "grade", t: "Grade" },
+    { k: "transparency", t: "Transp.", num: true, f: (v) => v.toFixed(2) },
+    { k: "fwhm", t: "FWHM px", num: true, f: (v) => v.toFixed(1) },
+    { k: "ecc", t: "Ecc.", num: true, f: (v) => v.toFixed(2) },
+    { k: "stars", t: "Stars", num: true, f: (v) => v.toLocaleString() },
+    { k: "sky", t: "Sky e/s", num: true, f: (v) => v.toFixed(3) },
+    { k: "trails", t: "Trails", num: true, f: (v) => String(v) },
+    { k: "reasons", t: "Reasons" },
+  ];
+  const ORDER = { good: 0, warn: 1, reject: 2 };
+
+  function table(wrap, frames) {
+    const tbl = h("table");
+    const thead = h("thead"), tr = h("tr");
+    const tbody = h("tbody");
+    let sortK = "x", dir = 1;
+    COLS.forEach((c) => {
+      const th = h("th", { class: c.num ? "num" : "", scope: "col", tabindex: "0", text: c.t });
+      const go = () => {
+        if (c.k === "reasons") return;
+        dir = sortK === c.k ? -dir : 1; sortK = c.k;
+        for (const o of tr.children) o.removeAttribute("aria-sort");
+        th.setAttribute("aria-sort", dir > 0 ? "ascending" : "descending");
+        fill();
+      };
+      th.addEventListener("click", go);
+      th.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
+      tr.append(th);
+    });
+    thead.append(tr);
+    tbl.append(thead, tbody);
+    wrap.append(tbl);
+    function key(f) { const v = sortK === "time" ? f.x : sortK === "grade" ? ORDER[f.grade] : f[sortK]; return v == null ? -Infinity : v; }
+    function fill() {
+      const rows = frames.slice().sort((a, b) => { const p = key(a), q = key(b); return (p < q ? -1 : p > q ? 1 : 0) * dir; });
+      tbody.replaceChildren();
+      for (const f of rows) {
+        const row = h("tr", { class: visible(f) ? "" : "dim" });
+        for (const c of COLS) {
+          let td;
+          if (c.k === "grade") td = h("td", {}, statusChip(f.grade));
+          else if (c.k === "reasons") {
+            td = h("td", { class: "reasons" });
+            for (const r of f.reasons) td.append(h("div", { text: r }));
+            for (const n of f.notes) td.append(h("div", { class: "note", text: n }));
+          } else if (c.k === "time") {
+            td = h("td", {}, document.createTextNode(f.time));
+            if (f.inReject) td.append(h("span", { class: "badge", text: "in reject folder" }));
+          } else {
+            const v = f[c.k];
+            td = h("td", { class: c.num ? "num" : "nowrap", text: v == null ? "–" : (c.f ? c.f(v) : String(v)) });
+          }
+          row.append(td);
+        }
+        tbody.append(row);
+      }
+    }
+    fill();
+    redraws.push(fill);
+  }
+
+  const SPECS = [
+    { key: "fwhm", title: "FWHM (px)", fmt: (v) => v.toFixed(1), tip: (v) => v.toFixed(2) + " px FWHM", floor0: true },
+    { key: "transparency", title: "Transparency (1 = field's best frame)", fmt: (v) => v.toFixed(1), tip: (v) => "Transparency " + v.toFixed(2), min: 0, max: 1.05, ref: 1 },
+    { key: "sky", title: "Sky background (e-/px/s)", fmt: (v) => v.toFixed(2), tip: (v) => v.toFixed(3) + " e-/px/s", floor0: true },
+  ];
+
+  for (const n of D.nights) {
+    const g = (k) => n.frames.filter((f) => f.grade === k).length;
+    const sec = h("section");
+    sec.append(h("h2", { text: n.label }));
+    sec.append(h("div", { class: "sub", text: `${n.frames.length} frames · ${g("good")} good · ${g("warn")} warn · ${g("reject")} reject` }));
+    const charts = h("div", { class: "charts" });
+    for (const spec of SPECS) { const card = h("div", { class: "card chart" }); charts.append(card); chart(card, n.frames, spec); }
+    sec.append(charts);
+    const wrap = h("div", { class: "tablewrap" });
+    sec.append(wrap);
+    table(wrap, n.frames);
+    $("nights").append(sec);
+  }
+  // Calibration checks: flat error maps, sets, flat-set comparisons.
+  const themeHooks = [];
+  themeBtn.addEventListener("click", () => { for (const f of themeHooks) f(); });
+  try { matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { for (const f of themeHooks) f(); }); } catch (e) {}
+  function hex(v) { const n = parseInt(v.replace("#", ""), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; }
+  function divColour(p, range) {
+    const cs = getComputedStyle(document.documentElement);
+    const mid = hex(cs.getPropertyValue("--div-mid").trim());
+    const end = hex(cs.getPropertyValue(p < 0 ? "--div-neg" : "--div-pos").trim());
+    const t = Math.min(1, Math.abs(p) / range);
+    return mid.map((m, i) => Math.round(m + (end[i] - m) * t));
+  }
+  function textTip(lines, ev) {
+    tip.replaceChildren(...lines.map((l, i) => h("div", { class: i ? "r" : "v", text: l })));
+    tip.style.display = "block";
+    const pad = 14, w = tip.offsetWidth, hgt = tip.offsetHeight;
+    let x = ev.clientX + pad, y = ev.clientY + pad;
+    if (x + w > window.innerWidth - 8) x = ev.clientX - w - pad;
+    if (y + hgt > window.innerHeight - 8) y = ev.clientY - hgt - pad;
+    tip.style.left = x + "px"; tip.style.top = y + "px";
+  }
+  const pct = (v) => (v < 0 ? "−" : "+") + Math.abs(v).toFixed(1) + "%";
+  const C = D.cal || { sets: [], pairs: [] };
+  if (C.sets.length) {
+    const sec = $("calchecks");
+    sec.append(h("h2", { text: "Calibration frames" }));
+    sec.append(h("div", { class: "sub", text: "Bias and darks are compared with their own set. Flats are checked for change within the set and against the illumination the lights received: each map shows the error a calibrated light would carry, smoothed, with the target masked." }));
+    const RANGE = 10;
+    const maps = C.sets.filter((x) => x.vs);
+    if (maps.length) {
+      const grid = h("div", { class: "charts" });
+      for (const st of maps) {
+        const v = st.vs;
+        const card = h("div", { class: "card heat" });
+        card.append(h("h3", { text: st.label }));
+        card.append(h("div", { class: "meta" }, statusChip(v.reliable ? v.grade : "warn"),
+          h("span", { text: `${v.spread.toFixed(1)}% error · ${v.lights} lights · ${v.nights}${v.reliable ? "" : ` · unreliable, ${Math.round(v.masked * 100)}% masked`}` })));
+        const cv = h("canvas", { width: v.map.w, height: v.map.h, role: "img", "aria-label": `Flat error map for ${st.label}: ${v.spread.toFixed(1)}% peak to peak` });
+        card.append(cv);
+        const draw = () => {
+          const ctx = cv.getContext("2d"), img = ctx.createImageData(v.map.w, v.map.h);
+          v.map.v.forEach((c, i) => { const [r, g, b] = divColour(c / 10, RANGE); img.data.set([r, g, b, 255], i * 4); });
+          ctx.putImageData(img, 0, 0);
+        };
+        draw();
+        themeHooks.push(draw);
+        cv.addEventListener("pointermove", (ev) => {
+          const r = cv.getBoundingClientRect();
+          const x = Math.min(v.map.w - 1, Math.max(0, Math.floor((ev.clientX - r.left) / r.width * v.map.w)));
+          const y = Math.min(v.map.h - 1, Math.max(0, Math.floor((ev.clientY - r.top) / r.height * v.map.h)));
+          const val = v.map.v[y * v.map.w + x] / 10;
+          textTip([pct(val), val < 0 ? "darker than the centre after calibration" : "brighter than the centre after calibration"], ev);
+        });
+        cv.addEventListener("pointerleave", hideTip);
+        const bar = h("div", { class: "bar" });
+        const grad = () => { bar.style.background = `linear-gradient(90deg, rgb(${divColour(-RANGE, RANGE)}), rgb(${divColour(0, RANGE)}), rgb(${divColour(RANGE, RANGE)}))`; };
+        grad();
+        themeHooks.push(grad);
+        card.append(h("div", { class: "scale" }, h("span", { text: "−10% darker" }), bar, h("span", { text: "+10% brighter" })));
+        const e = v.edges;
+        card.append(h("div", { class: "edges", text: `Left ${pct(e.left)} · Right ${pct(e.right)} · Top ${pct(e.top)} · Bottom ${pct(e.bottom)}` }));
+        grid.append(card);
+      }
+      sec.append(grid);
+    }
+    const wrap = h("div", { class: "tablewrap" });
+    const tbl = h("table");
+    const hr = h("tr");
+    for (const t of ["Set", "Grade", "Measurements", "Against lights", "Reasons"]) hr.append(h("th", { scope: "col", class: t === "Against lights" ? "num" : "", text: t }));
+    tbl.append(h("thead", {}, hr));
+    const tb = h("tbody");
+    for (const st of C.sets) {
+      const reasons = h("td", { class: "reasons" });
+      for (const r of st.reasons) reasons.append(h("div", { text: r }));
+      for (const n of st.notes) reasons.append(h("div", { class: "note", text: n }));
+      if (st.offset) reasons.append(h("div", { class: "note", text: "Offset: " + st.offset }));
+      if (st.frames.length) {
+        const d = h("details", { class: "frames" }, h("summary", { text: `${st.frames.length} frame${st.frames.length === 1 ? "" : "s"} flagged` }));
+        for (const f of st.frames) d.append(h("div", {}, statusChip(f.grade), document.createTextNode(` ${f.file} — ${f.reasons.join("; ")}`)));
+        reasons.append(d);
+      }
+      const vs = st.vs ? `${st.vs.spread.toFixed(1)}%${st.vs.reliable ? "" : " (unreliable)"}` : "–";
+      tb.append(h("tr", {}, h("td", { text: st.label }), h("td", {}, statusChip(st.grade)), h("td", { text: st.facts }), h("td", { class: "num", text: vs }), reasons));
+    }
+    tbl.append(tb);
+    wrap.append(tbl);
+    sec.append(wrap);
+    if (C.pairs.length) {
+      sec.append(h("h3", { style: "margin-top:20px", text: "Flat sets compared (difference of the smoothed flats, % peak to peak)" }));
+      const w2 = h("div", { class: "tablewrap" }), t2 = h("table"), r2 = h("tr");
+      for (const t of ["Filter", "Set", "Against", "Difference", "Dust", "Where"]) r2.append(h("th", { scope: "col", class: t === "Difference" || t === "Dust" ? "num" : "", text: t }));
+      t2.append(h("thead", {}, r2));
+      const b2 = h("tbody");
+      for (const p of C.pairs) {
+        const where = h("td", { class: "reasons", text: p.shape || "–" });
+        if (p.combinable) where.prepend(h("span", { class: "badge", style: "margin:0 6px 0 0", text: "can combine" }));
+        b2.append(h("tr", {}, h("td", { text: p.filter }), h("td", { text: p.a }), h("td", { text: p.b }), h("td", { class: "num", text: p.spread.toFixed(1) + "%" }), h("td", { class: "num", text: p.dust == null ? "–" : p.dust.toFixed(2) }), where));
+      }
+      t2.append(b2); w2.append(t2); sec.append(w2);
+    }
+    if (C.choices && C.choices.length) {
+      sec.append(h("h3", { style: "margin-top:20px", text: "Flats for each night (nearest good set, confirmed by matching its dust with the lights)" }));
+      sec.append(h("div", { class: "muted", style: "font-size:12px", text: C.library }));
+      const w3 = h("div", { class: "tablewrap" }), t3 = h("table"), r3 = h("tr");
+      for (const t of ["Night", "Filter", "Lights", "Grade", "Flats", "Dust", "Also"]) r3.append(h("th", { scope: "col", class: t === "Lights" || t === "Dust" ? "num" : "", text: t }));
+      t3.append(h("thead", {}, r3));
+      const b3 = h("tbody");
+      const opt = (o) => `${o.label} (${o.days > 0 ? "+" : ""}${o.days} nights${o.dust == null ? "" : ", dust " + o.dust.toFixed(2)})`;
+      for (const c of C.choices) {
+        b3.append(h("tr", {},
+          h("td", { class: "nowrap", text: c.night }), h("td", { text: c.filter }), h("td", { class: "num", text: String(c.lights) }),
+          h("td", {}, statusChip(c.grade)), h("td", { class: "reasons", text: c.reason }),
+          h("td", { class: "num", text: c.chosen && c.chosen.dust != null ? c.chosen.dust.toFixed(2) : "–" }),
+          h("td", { class: "reasons" }, ...c.others.map((o) => h("div", { class: "note", text: opt(o) })))));
+      }
+      t3.append(b3); w3.append(t3); sec.append(w3);
+    }
+    if (C.lightOffsets && C.lightOffsets.length) sec.append(h("div", { class: "muted", style: "margin-top:8px;font-size:12px", text: "Lights offset for the flat check: " + C.lightOffsets.join(", ") }));
+  }
+
+  $("footer").textContent = D.footer;
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+{
+ "format": "crux-denoise",
+ "version": 1,
+ "k": 3.0,
+ "fwhm_scale": 4.0,
+ "multiple": 16,
+ "inputs": [
+  "asinh((v - sky) / (k * noise))",
+  "fwhm / fwhm_scale"
+ ],
+ "parameters": 1925313,
+ "iters": 20000,
+ "model": "r9-origin (tools/ml/train.py): ASI2600, ASI294MC, EOS 80D and Celestron Origin bundles, STL-11000M and QHY9 held out",
+ "held_out_gain": {
+  "all": 1.14,
+  "faint": 6.82
+ }
+}

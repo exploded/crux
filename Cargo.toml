@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = ["crates/crux-core", "crates/crux-cli", "crates/crux-gui"]
+default-members = ["crates/crux-core", "crates/crux-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/exploded/crux"
+
+[workspace.dependencies]
+crux-core = { path = "crates/crux-core", default-features = false }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+chrono-tz = { version = "0.10", features = ["serde"] }
+rayon = "1.10"
+walkdir = "2"
+roxmltree = "0.20"
+flate2 = "1"
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-decode", "safe-encode"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+sha2 = "0.10"
+dirs = "6"
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+[profile.release]
+debug = 1
+lto = "thin"
+
+# Pixel loops are hot even in debug builds; keep tests usable.
+[profile.dev.package."*"]
+opt-level = 2
+[profile.dev]
+opt-level = 1

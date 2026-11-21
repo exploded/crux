@@ -1,0 +1,44 @@
+# Build
+/target
+
+# Private notes and local data
+CLAUDE.md
+CLAUDE.local.md
+.claude/settings.local.json
+.local/
+.crux/
+docs/promo/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Training runs and scratch
+*.pt
+*.npy
+
+# Image data must never be committed (models/ and assets/ are tracked)
+*.fit
+*.fits
+*.fts
+*.xisf
+*.cr2
+*.CR2
+*.nef
+*.tif
+*.tiff
+
+# Databases, logs, secrets
+*.db
+*.db-*
+*.log
+.env
+
+# Editors and OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
