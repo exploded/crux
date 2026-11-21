@@ -27,6 +27,51 @@ pub struct LibView {
     pub library: Option<crux_core::library::Library>,
     /// Unit path key → its picture (crux's image, else a JPG/PNG in it).
     pub images: HashMap<String, PathBuf>,
+    /// Unit path key → what crux has made for it in the workspace.
+    pub made: HashMap<String, Made>,
+}
+
+/// What crux has made for a folder in the workspace: integrated masters
+/// and finished images (newest of each), read when the library opens.
+#[derive(Debug, Clone, Copy)]
+pub struct Made {
+    pub masters: usize,
+    pub masters_at: std::time::SystemTime,
+    pub image_at: Option<std::time::SystemTime>,
+}
+
+/// None when nothing has been stacked for `dir` yet.
+pub fn made(dir: &Path, workspace: &Path) -> Option<Made> {
+    let out = crux_core::process::job::out_dir(dir, workspace);
+    let targets = crux_core::render::targets(&out);
+    let mtime = |p: &Path| p.metadata().and_then(|m| m.modified()).ok();
+    let masters: Vec<std::time::SystemTime> = targets.iter().flat_map(|t| t.masters.iter()).filter_map(|m| mtime(&m.path)).collect();
+    let masters_at = masters.iter().max().copied()?;
+    // Finished images (JPEG, PNG or XISF; older runs wrote no JPEG), not
+    // the preview.
+    let image_at = targets
+        .iter()
+        .filter_map(|t| std::fs::read_dir(t.image_dir(&out)).ok())
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.file_name().is_some_and(|n| n != "preview.png"))
+        .filter(|p| p.extension().is_some_and(|x| ["jpg", "png", "xisf"].iter().any(|e| x.eq_ignore_ascii_case(e))))
+        .filter_map(|p| mtime(&p))
+        .max();
+    Some(Made { masters: masters.len(), masters_at, image_at })
+}
+
+/// A card's status from what's been made: green once an image is newer
+/// than every master.
+fn made_status(m: &Made, p: &crate::theme::Pal) -> (Option<egui::Color32>, String) {
+    let day = |t: std::time::SystemTime| chrono::DateTime::<chrono::Local>::from(t).date_naive();
+    let masters = format!("{} master{}", m.masters, if m.masters == 1 { "" } else { "s" });
+    match m.image_at {
+        Some(i) if i >= m.masters_at => (Some(p.good), format!("Image made {} · {masters}", d_short(day(i)))),
+        Some(_) => (Some(p.accent), format!("Stacked again {} · image older", d_short(day(m.masters_at)))),
+        None => (Some(p.accent), format!("Stacked {} · {masters}, no image yet", d_short(day(m.masters_at)))),
+    }
 }
 
 #[derive(Default)]
@@ -321,8 +366,11 @@ fn card_for(t: &crux_core::targets::Target, v: &LibView, p: &crate::theme::Pal) 
         t.nights.len(),
         if t.nights.len() == 1 { "" } else { "s" }
     );
+    let made = units.first().and_then(|u| v.made.get(&crux_core::paths::key(&u.path)));
     let status = if units.len() > 1 {
         (Some(p.warn), format!("in {} folders", units.len()))
+    } else if let Some(m) = made {
+        made_status(m, p)
     } else if !t.notes.is_empty() {
         (Some(p.accent), t.notes[0].split(" (").next().unwrap_or(&t.notes[0]).to_string())
     } else {

@@ -6,5 +6,5 @@ fn builtin_sharpen() -> Option<(&'static [u8], &'static str, &'static str)> {
 }
 
 fn builtin_starless() -> Option<(&'static [u8], &'static str, &'static str)> {
-    Some((include_bytes!("starless-1.onnx"), include_str!("starless-1.json"), "starless-1"))
+    Some((include_bytes!("starless-2.onnx"), include_str!("starless-2.json"), "starless-2"))
 }

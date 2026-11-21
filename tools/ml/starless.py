@@ -10,6 +10,13 @@ star colours need.
 
 Inputs: [asinh image, FWHM / 4]. Never uses any other program's output.
 
+With --real-bright, a share of patches also get real bright stars: cut
+from crux's denoised masters (the star corrector's cache) where they sit
+on flat sky, with their halos, diffraction spikes and saturated cores, the
+sky under them fitted on a ring and removed. Synthetic halos and spikes
+(--bright, run s2) looked like nebula and taught the network to touch it;
+real ones come with the core that explains them.
+
     python starless.py --backgrounds C:/crux-work/train/starless --bundles C:/crux-work/train \
         --denoiser ../../.local/ml/runs/r2-holdout-stl-qhy9/model.pt --out ../../.local/ml/runs/s1
 """
@@ -40,12 +47,12 @@ class Background:
         self.name, self.img, self.sky, self.sigma, self.fwhm = name, img, sky, sigma, fwhm
 
 
-def load_backgrounds(folder: Path, denoiser: Path, cache: Path, device) -> list[Background]:
+def load_backgrounds(folder: Path, denoiser: Path, cache: Path, device, workspaces: list[Path]) -> list[Background]:
     cache.mkdir(parents=True, exist_ok=True)
     ck = torch.load(denoiser, map_location=device)
     net = UNet(base=ck.get("base", 32), depth=ck.get("depth", 3)).to(device).eval()
     net.load_state_dict(ck["model"])
-    known = crux_fwhm(Path(folder).parent.parent)
+    known = crux_fwhm(workspaces)
     out = []
     for f in sorted(Path(folder).glob("*.fits")):
         stem = f.stem.split("_", 1)[1] if not f.stem.startswith("masterLight") else f.stem
@@ -92,9 +99,71 @@ def psf_bank(roots: list[Path], exclude: list[str]) -> list[tuple[np.ndarray, fl
     return out
 
 
+def real_bright_bank(cache: Path, exclude: list[str], radius: int = 64, min_peak: float = 300.0, per_master: int = 40, floor: float = 1.5) -> list[np.ndarray]:
+    """Real bright stars (sky removed, edges tapered to 0) from denoised
+    masters (`deconv.py`'s cache: img, sky, sigma). A star qualifies when its
+    peak is ≥ `min_peak` noise σ above the sky and the ring at 0.85–1 of
+    `radius` is flat: its eight sectors' medians agree within 1.5σ after a
+    plane is removed, so no nebula comes along. Light under `floor` σ of the
+    original noise is cut away (soft threshold)."""
+    out = []
+    r = radius
+    yy, xx = np.mgrid[-r : r + 1, -r : r + 1].astype(np.float32)
+    rr = np.sqrt(yy * yy + xx * xx)
+    ring = (rr >= 0.85 * r) & (rr <= r)
+    sector = ((np.arctan2(yy, xx) + math.pi) / (2 * math.pi) * 8).astype(int) % 8
+    taper = np.clip((r - rr) / (0.25 * r), 0, 1)
+    taper = (0.5 - 0.5 * np.cos(math.pi * taper)).astype(np.float32)
+    A = np.stack([np.ones(ring.sum()), xx[ring], yy[ring]], 1)
+    for f in sorted(Path(cache).glob("*.npz")):
+        if any(e.lower() in f.stem.lower() for e in exclude):
+            continue
+        z = np.load(f)
+        img, sky, sigma = z["img"].astype(np.float32), float(z["sky"]), float(z["sigma"])
+        h, w = img.shape
+        # Local maxima (7 × 7) far above the sky, brightest first.
+        t = torch.from_numpy(img)[None, None]
+        mx = F.max_pool2d(t, 7, 1, 3)[0, 0].numpy()
+        ys, xs = np.nonzero((img == mx) & (img > sky + min_peak * sigma))
+        order = np.argsort(-img[ys, xs])
+        taken: list[tuple[int, int]] = []
+        n = 0
+        for i in order:
+            y, x = int(ys[i]), int(xs[i])
+            if y < r or x < r or y >= h - r or x >= w - r:
+                continue
+            if any(abs(y - ty) <= r and abs(x - tx) <= r for ty, tx in taken):
+                continue
+            cut = img[y - r : y + r + 1, x - r : x + r + 1]
+            v = cut[ring].astype(np.float64)
+            keep = np.ones(len(v), bool)
+            for _ in range(3):
+                coef, *_ = np.linalg.lstsq(A[keep], v[keep], rcond=None)
+                res = v - A @ coef
+                s_ = 1.4826 * np.median(np.abs(res[keep] - np.median(res[keep]))) + 1e-12
+                keep = np.abs(res) < 3 * s_
+            med = [np.median(res[(sector[ring] == k) & keep]) for k in range(8) if ((sector[ring] == k) & keep).any()]
+            if len(med) < 8 or max(med) - min(med) > 1.5 * sigma or math.hypot(coef[1], coef[2]) * 2 * r > 3 * sigma:
+                continue
+            plane = (coef[0] + coef[1] * xx + coef[2] * yy).astype(np.float32)
+            if cut[r, r] - plane[r, r] < min_peak * sigma:
+                continue
+            # Faint structure (denoised sky, nebula residue) under 1.5σ of
+            # the original noise goes: real halos and spikes are far above it.
+            out.append((np.maximum(cut - plane - floor * sigma, 0) * taper).astype(np.float32))
+            taken.append((y, x))
+            n += 1
+            if n >= per_master:
+                break
+        print(f"  {f.stem}: {n} bright stars", flush=True)
+    return out
+
+
 MAX_PEAK = 3000.0  # brightest star peak, noise σ
 BRIGHT = False  # add halos and diffraction spikes to bright stars
 P_BRIGHT = 1.0  # share of patches that get them
+REAL: list[np.ndarray] = []  # real bright stars (`real_bright_bank`)
+P_REAL = 0.0  # share of patches that get one to three of them
 
 
 def bright(stars: np.ndarray, y0: int, x0: int, peak: float, fw: float, angle: float, rng: random.Random):
@@ -158,6 +227,17 @@ def batch(bgs, psfs, bank, n, rng, device):
             fws.append(fw)
             if bright_patch and peak_snr > 300:
                 bright(stars, cy + sh // 2, cx + sh // 2, peak_snr * sigma0, fw, spike_angle, rng)
+        if REAL and rng.random() < P_REAL:
+            for _ in range(rng.choice([1, 1, 2, 3])):
+                st = np.rot90(rng.choice(REAL), rng.randrange(4))
+                if rng.random() < 0.5:
+                    st = st[:, ::-1]
+                sh = st.shape[0]
+                cy, cx = rng.randrange(-sh // 3, c - 2 * sh // 3), rng.randrange(-sh // 3, c - 2 * sh // 3)
+                ya, xa = max(0, cy), max(0, cx)
+                yb, xb = min(c, cy + sh), min(c, cx + sh)
+                if yb > ya and xb > xa:
+                    stars[ya:yb, xa:xb] += rng.uniform(0.3, 1.2) * st[ya - cy : yb - cy, xa - cx : xb - cx]
         img = np.minimum(bg + stars, 1.0)
         t = torch.from_numpy(np.stack([img, bg]))[None].to(device)
         if f > 1.0:
@@ -197,17 +277,25 @@ def main():
     ap.add_argument("--bright", action="store_true", help="halos and diffraction spikes on bright stars")
     ap.add_argument("--p-bright", type=float, default=1.0, help="share of patches with bright stars")
     ap.add_argument("--init", type=Path, help="start from this checkpoint (fine-tune)")
+    ap.add_argument("--workspaces", type=Path, nargs="+", default=[Path("C:/crux-work"), Path("D:/crux-work")], help="where crux-integration.json gives each master's FWHM")
+    ap.add_argument("--real-bright", type=Path, help="denoised masters (deconv.py's cache) to cut real bright stars from")
+    ap.add_argument("--p-real", type=float, default=0.4, help="share of patches with real bright stars")
+    ap.add_argument("--real-radius", type=int, default=64, help="real bright star cutout radius, px")
+    ap.add_argument("--real-floor", type=float, default=1.5, help="light under this many noise σ is cut from real bright stars")
     args = ap.parse_args()
-    global MAX_PEAK, BRIGHT, P_BRIGHT
+    global MAX_PEAK, BRIGHT, P_BRIGHT, REAL, P_REAL
     MAX_PEAK, BRIGHT, P_BRIGHT = args.max_peak, args.bright, args.p_bright
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
     print("backgrounds:", flush=True)
-    bgs = load_backgrounds(args.backgrounds, args.denoiser, args.out.parent / "starless_cache", device)
+    bgs = load_backgrounds(args.backgrounds, args.denoiser, args.out.parent / "starless_cache", device, args.workspaces)
+    if args.real_bright:
+        print("real bright stars:", flush=True)
+        REAL, P_REAL = real_bright_bank(args.real_bright, args.exclude, radius=args.real_radius, floor=args.real_floor), args.p_real
     psfs = psf_bank(args.bundles, args.exclude)
     bank = noise_bank(args.bundles, args.exclude)
-    print(f"{len(bgs)} backgrounds, {len(psfs)} star stamps, {len(bank)} noise patches", flush=True)
+    print(f"{len(bgs)} backgrounds, {len(psfs)} star stamps, {len(REAL)} real bright stars, {len(bank)} noise patches", flush=True)
     vrng = random.Random(999)
     val = [batch(bgs, psfs, bank, args.batch, vrng, device) for _ in range(8)]
     net = UNet(base=args.base, depth=args.depth, inputs=2).to(device)
@@ -242,7 +330,7 @@ def main():
     meta = {"format": "crux-starless", "version": 1, "k": 3.0, "fwhm_scale": FWHM_SCALE, "multiple": 2 ** args.depth * 2,
             "inputs": ["asinh((v - sky) / (k * noise))", "fwhm / fwhm_scale"],
             "backgrounds": [g.name for g in bgs], "iters": args.iters, "parameters": parameters(net),
-            "max_peak": MAX_PEAK, "bright": BRIGHT}
+            "max_peak": MAX_PEAK, "bright": BRIGHT, "real_bright": len(REAL), "p_real": P_REAL, "real_radius": args.real_radius, "real_floor": args.real_floor}
     (args.out / "starless.json").write_text(json.dumps(finite(meta), indent=1, allow_nan=False), encoding="utf-8")
     print("exported", args.out / "starless.onnx", flush=True)
 

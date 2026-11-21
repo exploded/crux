@@ -105,10 +105,21 @@ painted on at random places and brightnesses (with `--bright`, halos and
 diffraction spikes on bright stars), plus real noise; the target keeps the
 same noise, so the network removes stars only.
 
+`--real-bright <deconv.py's cache>` adds real bright stars to a share of
+patches (`--p-real`): cut from the denoised masters where they sit on flat
+sky, with their halos, spikes and saturated cores, light under
+`--real-floor` noise σ cut away. Synthetic halos (`--bright`) look like
+nebula and teach the network to touch it; real ones don't. The built-in
+`starless-2` is s1 fine-tuned this way:
+
 ```powershell
-..\..\.local\ml\venv\Scripts\python starless.py --backgrounds <workspace>\train\starless --bundles <workspace>\train --denoiser ..\..\.local\ml\runs\r2-holdout-stl-qhy9\model.pt --out ..\..\.local\ml\runs\s2 --max-peak 20000 --bright
+..\..\.local\ml\venv\Scripts\python starless.py --backgrounds <workspace>\train\starless --bundles <workspace>\train --denoiser ..\..\.local\ml\runs\r2-holdout-stl-qhy9\model.pt --out ..\..\.local\ml\runs\s4 --init ..\..\.local\ml\runs\s1\model.pt --iters 6000 --real-bright ..\..\.local\ml\runs\deconv_cache_r9-origin --p-real 0.4
 python starless_check.py original.fits classic.fits network.fits --png cmp.png
 ```
+
+Check a run with `eval_starless.sh <crux.exe> <scratch dir> <run dir>...`
+(stars crux still finds, change away from stars) and `bright_residual.py
+original.fits starless.fits...` (glow or hole left at the brightest stars).
 
 ## Putting a model into crux
 

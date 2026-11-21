@@ -144,9 +144,13 @@ fn open(job: &OpenJob, tx: &Sender<Msg>, ctx: &egui::Context) -> anyhow::Result<
         let solved = |p: &Path, size: u64, mtime: i64| ix.as_ref().and_then(|ix| ix.solution(p, size, mtime)).flatten().map(|s| (s.ra, s.dec));
         let targets = crux_core::targets::find(&[(root.clone(), &h)], &solved);
         let mut images = HashMap::new();
+        let mut made = HashMap::new();
         for u in targets.units.iter().filter(|u| u.lights() > 0) {
             if let Some(img) = crux_image(&u.path, &cfg.process.workspace).or_else(|| find_image(&u.path)) {
                 images.insert(crux_core::paths::key(&u.path), img);
+            }
+            if let Some(m) = crate::libview::made(&u.path, &cfg.process.workspace) {
+                made.insert(crux_core::paths::key(&u.path), m);
             }
         }
         let library = crux_core::library::Library::load(&cfg.library).ok().flatten();
@@ -158,6 +162,7 @@ fn open(job: &OpenJob, tx: &Sender<Msg>, ctx: &egui::Context) -> anyhow::Result<
             configured,
             library,
             images,
+            made,
         })));
         ctx.request_repaint();
         let _ = cache.save();
