@@ -284,6 +284,18 @@ enum Cmd {
         /// Default: the recipe's (natural).
         #[arg(long, value_parser = ["natural", "keep", "network"])]
         stars: Option<String>,
+        /// Natural stars: one stretch for the stars and the starless image
+        /// (stars recoloured in place) instead of stretching them separately
+        /// and screening the stars on.
+        #[arg(long)]
+        one_stretch: bool,
+        /// Natural stars stretched separately: how hard the star layer is
+        /// stretched (1 = like the nebula on dark sky; default 0.6).
+        #[arg(long)]
+        star_size: Option<f64>,
+        /// Natural stars stretched separately: star brightness (default 1).
+        #[arg(long)]
+        star_brightness: Option<f64>,
         /// Also save the recipe under this name.
         #[arg(long)]
         save_recipe: Option<String>,
@@ -865,7 +877,7 @@ fn run() -> Result<()> {
             let out = crux_core::process::job::out_dir(dir, &ws);
             mosaic(&out, target.as_deref(), &s, *force, cfg.process.fits)?
         }
-        Cmd::Image { dir, workspace, object, recipe, preset, no_gradient, stars, save_recipe, denoise, sharpen, sharpen_amount, engine, no_enhance } => image(&cli, dir, workspace.as_deref(), object.as_deref(), recipe.as_deref(), preset.as_deref(), *no_gradient, stars.as_deref(), save_recipe.as_deref(), &EnhanceArgs { denoise: *denoise, sharpen: sharpen.clone(), sharpen_amount: *sharpen_amount, engine: engine.clone(), off: *no_enhance })?,
+        Cmd::Image { dir, workspace, object, recipe, preset, no_gradient, stars, one_stretch, star_size, star_brightness, save_recipe, denoise, sharpen, sharpen_amount, engine, no_enhance } => image(&cli, dir, workspace.as_deref(), object.as_deref(), recipe.as_deref(), preset.as_deref(), *no_gradient, &StarArgs { mode: stars.clone(), one_stretch: *one_stretch, size: *star_size, brightness: *star_brightness }, save_recipe.as_deref(), &EnhanceArgs { denoise: *denoise, sharpen: sharpen.clone(), sharpen_amount: *sharpen_amount, engine: engine.clone(), off: *no_enhance })?,
         Cmd::Recipe { what } => match what.as_ref().unwrap_or(&RecipeCmd::List) {
             RecipeCmd::List => {
                 let l = crux_core::render::recipe::list();
@@ -1768,7 +1780,15 @@ impl EnhanceArgs {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn image(cli: &Cli, dir: &Path, workspace: Option<&Path>, object: Option<&str>, recipe: Option<&str>, preset: Option<&str>, no_gradient: bool, stars: Option<&str>, save_recipe: Option<&str>, enhance: &EnhanceArgs) -> Result<()> {
+/// `crux image`'s star options.
+struct StarArgs {
+    mode: Option<String>,
+    one_stretch: bool,
+    size: Option<f64>,
+    brightness: Option<f64>,
+}
+
+fn image(cli: &Cli, dir: &Path, workspace: Option<&Path>, object: Option<&str>, recipe: Option<&str>, preset: Option<&str>, no_gradient: bool, stars: &StarArgs, save_recipe: Option<&str>, enhance: &EnhanceArgs) -> Result<()> {
     use crux_core::render::{self, palette, recipe::Recipe};
     let (cfg, _) = Config::load(cli.config.as_deref(), Some(dir))?;
     let ws = workspace.map(Path::to_path_buf).unwrap_or_else(|| cfg.process.workspace.clone());
@@ -1802,7 +1822,16 @@ fn image(cli: &Cli, dir: &Path, workspace: Option<&Path>, object: Option<&str>, 
         if no_gradient {
             r.gradient.enabled = false;
         }
-        match stars {
+        if stars.one_stretch {
+            r.stars.separate = false;
+        }
+        if let Some(v) = stars.size {
+            r.stars.size = v.clamp(0.05, 3.0);
+        }
+        if let Some(v) = stars.brightness {
+            r.stars.brightness = v.clamp(0.0, 3.0);
+        }
+        match stars.mode.as_deref() {
             Some("keep") => r.stars.mode = crux_core::render::stars::StarMode::Keep,
             Some("natural") => r.stars.mode = crux_core::render::stars::StarMode::Natural,
             Some("network") => {
@@ -1881,9 +1910,14 @@ fn image(cli: &Cli, dir: &Path, workspace: Option<&Path>, object: Option<&str>, 
             let at = |n: &str| names_p.iter().position(|c| c == n);
             let g = |n: &str| at(n).map(|i| p.star_gain[i] / at("H").map(|h| p.star_gain[h]).unwrap_or(1.0));
             println!(
-                "  stars: {} found ({:.1}% of the frame), recoloured from their own light (median star white: O ×{:.2}{}; red {:.0}% of green)",
+                "  stars: {} found ({:.1}% of the frame), {} (median star white: O ×{:.2}{}; red {:.0}% of green)",
                 p.n_stars,
                 p.star_cover * 100.0,
+                if render::separate_on(&p, &r) {
+                    format!("stretched separately (size {:.0}%, brightness {:.0}%) and screened onto the starless image", r.stars.size * 100.0, r.stars.brightness * 100.0)
+                } else {
+                    "recoloured from their own light".to_string()
+                },
                 g("O").unwrap_or(1.0),
                 g("S").filter(|_| at("H").is_some()).map(|x| format!(", S ×{x:.2}")).unwrap_or_default(),
                 r.stars.ha_to_green * 100.0

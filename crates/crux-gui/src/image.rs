@@ -586,8 +586,8 @@ pub fn summary(a: &UiState, st: Stage) -> (Color32, String) {
                 (dot, "As mixed".into())
             } else {
                 match &img.prepared {
-                    Some(pp) if pp.n_stars > 0 => (dot, format!("Natural colours: {} stars, {:.1}% of the frame", pp.n_stars, pp.star_cover * 100.0)),
-                    _ => (dot, "Natural colours".into()),
+                    Some(pp) if pp.n_stars > 0 => (dot, format!("Natural colours{}: {} stars, {:.1}% of the frame", if r.stars.separate { ", stretched separately" } else { "" }, pp.n_stars, pp.star_cover * 100.0)),
+                    _ => (dot, if r.stars.separate { "Natural colours, stretched separately".into() } else { "Natural colours".into() }),
                 }
             }
         }
@@ -1451,7 +1451,7 @@ fn settings(ui: &mut Ui, a: &mut UiState, p: &Pal) {
             }
         }
         Stage::Stars => {
-            w::muted(ui, p, "The palette boosts OIII and SII to match Ha, and stars have a different profile in each filter, so mixed stars turn pink or magenta. crux finds each star, measures its light in every linear master, and gives it one natural colour from that light (R = Ha, B = OIII, G between them, with the median star white), keeping its size and brightness. This replaces StarXTerminator and NBtoRGB Stars. Faint or doubtful stars and stars on bright nebula keep the mixed colour. Only the stars change.");
+            w::muted(ui, p, "The palette boosts OIII and SII to match Ha, and stars have a different profile in each filter, so mixed stars turn pink or magenta. crux finds each star, measures its light in every linear master, and gives it one natural colour from that light (R = Ha, B = OIII, G between them, with the median star white), keeping its size and brightness. This replaces StarXTerminator and NBtoRGB Stars. Stretched separately (the default), the starless image gets its own stretch, mix and finishing, and the stars their own gentler stretch, screened on top; light no measured star explains keeps the mixed colour. With one stretch, only the stars change, and faint or doubtful stars and stars on bright nebula keep the mixed colour.");
             let possible = img.target().is_some_and(|t| render::stars_possible(&t.channels()));
             if !possible {
                 w::muted(ui, p, "This target isn't narrowband with OIII, so its stars already have their colours.");
@@ -1496,6 +1496,22 @@ fn settings(ui: &mut Ui, a: &mut UiState, p: &Pal) {
                         }
                         src(ui, p, r.stars.engine != base.stars.engine, &base_label);
                     });
+                }
+                if r.stars.mode == render::stars::StarMode::Natural {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([150.0, 20.0], egui::Label::new(RichText::new("Stretch").font(body(13.0))));
+                        if w::chip(ui, p, "Stars separately", None, r.stars.separate).on_hover_text("The starless image gets its own stretch, mix and finishing; the stars get a gentler stretch of their own and are screened on top. Stars over bright nebula keep their brightness.").clicked() {
+                            r.stars.separate = true;
+                        }
+                        if w::chip(ui, p, "One stretch", None, !r.stars.separate).on_hover_text("Stars and nebula stretched together; the stars are then recoloured in place.").clicked() {
+                            r.stars.separate = false;
+                        }
+                        src(ui, p, r.stars.separate != base.stars.separate, &base_label);
+                    });
+                    if r.stars.separate {
+                        slider(ui, p, "Star size", &mut r.stars.size, 0.1..=1.5, base.stars.size, &base_label, true, "How hard the stars are stretched. 100% shows a star on dark sky as the nebula stretch would; lower gives smaller, fainter stars, mostly by dimming the faint ones and the halos.");
+                        slider(ui, p, "Star brightness", &mut r.stars.brightness, 0.0..=1.5, base.stars.brightness, &base_label, true, "100% screens the stretched stars on as they are; 0% leaves the starless image.");
+                    }
                 }
                 if depth != Depth::Auto && r.stars.mode == render::stars::StarMode::Natural {
                     slider(ui, p, "Red in green", &mut r.stars.ha_to_green, 0.0..=1.0, base.stars.ha_to_green, &base_label, true, "NBtoRGB's ratio: how much of the stars' green comes from red (Ha) rather than blue (OIII). 50% puts green halfway, as in a blackbody; lower gives bluer stars, higher yellower ones.");

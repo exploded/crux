@@ -20,7 +20,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Bump whenever `prepare` produces different results.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 const MAGIC: &[u8; 8] = b"CRUXPREP";
 
 /// Where a target's prepared cache lives.
@@ -41,7 +41,7 @@ pub fn signature(t: &Target, g: &GradientSettings, st: &StarSettings) -> String 
             format!("{}:{}:{}:{}:{}", m.channel, crate::paths::key(&m.path), size, mtime, sl)
         })
         .collect();
-    format!("v{VERSION}|{}|{}|{}", masters.join(","), serde_json::to_string(g).unwrap_or_default(), serde_json::to_string(st).unwrap_or_default())
+    format!("v{VERSION}|{}|{}|{}", masters.join(","), serde_json::to_string(g).unwrap_or_default(), st.mask_key())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -378,6 +378,10 @@ mod tests {
         // Other settings, or a master written again: not used.
         let g2 = GradientSettings { degree: 3, ..g.clone() };
         assert!(load(&file, &signature(&t, &g2, &st)).is_none());
+        // Render-only star settings keep it; the mask's don't.
+        let st2 = StarSettings { size: 1.2, brightness: 0.8, separate: false, saturation: 1.4, ..st.clone() };
+        assert!(load(&file, &signature(&t, &g, &st2)).is_some());
+        assert!(load(&file, &signature(&t, &g, &StarSettings { grow: 1.5, ..st.clone() })).is_none());
         std::thread::sleep(std::time::Duration::from_millis(20));
         let img = crate::read_image(&t.masters[0].path).unwrap();
         crate::xisf::write_image(&t.masters[0].path, &img, &Header::default(), None).unwrap();

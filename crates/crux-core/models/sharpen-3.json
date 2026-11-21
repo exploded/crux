@@ -14,5 +14,6 @@
  "max_scale": 2.6,
  "p_scale": 0.7,
  "flux_weight": 0.2,
- "model": "d2 (tools/ml/deconv.py): 21 ASI2600 master centres, denoised; random aberration kernels; truths downscaled up to 2.6x; flux-conservation term"
+ "camera_share": 0.9,
+ "model": "d5 (tools/ml/deconv.py): 26 master centres (ASI2600MM, ASI294MC Pro, EOS 80D, Celestron Origin), denoised; ASI2600 truths drawn 90% of the time, the other cameras equally; random aberration kernels; truths downscaled up to 2.6x; flux-conservation term"
 }

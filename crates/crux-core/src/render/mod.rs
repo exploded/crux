@@ -313,7 +313,7 @@ pub fn prepare(t: &Target, g: &GradientSettings, st: &stars::StarSettings, keep_
                     });
                 let sl = mask.as_ref().map(|mk| net_sl.unwrap_or_else(|| stars::starless(&img, mk, noise_full, k as u64 + 1)));
                 let sl_proxy = sl.as_ref().map(|s| proxy(s, PROXY_MAX));
-                let stats_starless = sl.as_ref().zip(sl_proxy.as_ref()).map(|(s, sp)| Stats::measure(&s.data, &sp.data));
+                let stats_starless = sl.as_ref().zip(sl_proxy.as_ref()).map(|(s, sp)| Stats { sky_noise: m.noise, ..Stats::measure(&s.data, &sp.data) });
                 let crop = cut(&img);
                 let crop_starless = sl.as_ref().map(&cut);
                 (m, img, raw_proxy, model, report, px, stats, noise_full, noise_proxy, sl, sl_proxy, stats_starless, crop, crop_starless)
@@ -426,11 +426,75 @@ pub fn stars_on(p: &Prepared, r: &Recipe) -> bool {
     r.stars.mode == stars::StarMode::Natural && p.channels.iter().all(|c| c.starless_proxy.is_some())
 }
 
-/// The coefficients a recipe gives for these channels (always from the
-/// original statistics: the Stars stage changes only the stars).
+/// The coefficients a recipe gives for these channels, from the original
+/// statistics: the whole picture when stars are kept or recoloured in
+/// place, and the colour of light no measured star explains when they're
+/// stretched separately.
 pub fn coefficients(p: &Prepared, r: &Recipe) -> palette::Coef {
     let stats: Vec<&Stats> = p.channels.iter().map(|c| &c.stats).collect();
     palette::coefficients(&p.names(), &stats, Some(&p.star_gain), &r.mix, &r.stretch, &r.finish)
+}
+
+/// Are the starless image and the stars stretched separately?
+pub fn separate_on(p: &Prepared, r: &Recipe) -> bool {
+    r.stars.separate && stars_on(p, r) && p.channels.iter().all(|c| c.stats_starless.is_some())
+}
+
+/// The starless image's coefficients when stretched separately: the same
+/// mix, stretch and finishing from the starless statistics, so the nebula
+/// is stretched as nebula (stars no longer lift the signal level or the
+/// spread). None otherwise.
+pub fn coefficients_starless(p: &Prepared, r: &Recipe) -> Option<palette::Coef> {
+    if !separate_on(p, r) {
+        return None;
+    }
+    let stats: Vec<&Stats> = p.channels.iter().map(|c| c.stats_starless.as_ref()).collect::<Option<_>>()?;
+    Some(palette::coefficients(&p.names(), &stats, Some(&p.star_gain), &r.mix, &r.stretch, &r.finish))
+}
+
+/// The star layer below this many of its own noise sigmas is left out, so
+/// the starless image's small residuals don't speckle the stars' stretch.
+pub const STAR_FLOOR_SIGMAS: f32 = 2.0;
+
+/// What the separate stretch needs for one render.
+pub struct Split {
+    pub coef: palette::Coef,
+    pub curve: stars::Curve,
+    /// Per channel: the star layer's floor at this render's resolution.
+    pub floor: Vec<f32>,
+}
+
+/// Noise σ of `full − bare` (1.4826 × MAD), registration borders left out:
+/// the star layer's own noise at that resolution (0 where the starless
+/// image is the original away from stars, as the classic fill's is).
+fn layer_sigma(full: &[f32], bare: &[f32]) -> f32 {
+    let step = (full.len() / 1_000_000).max(1);
+    let mut d: Vec<f32> = full.iter().zip(bare).step_by(step).filter(|(f, _)| **f > palette::ZERO_FLOOR).map(|(f, b)| f - b).collect();
+    if d.is_empty() {
+        return 0.0;
+    }
+    let m = d.len() / 2;
+    d.select_nth_unstable_by(m, |a, b| a.total_cmp(b));
+    let med = d[m];
+    for v in d.iter_mut() {
+        *v = (*v - med).abs();
+    }
+    d.select_nth_unstable_by(m, |a, b| a.total_cmp(b));
+    1.4826 * d[m]
+}
+
+/// The separate stretch's constants, with the floor measured on `planes`
+/// and `bare` (the render's own resolution, or a 1:1 crop standing in for
+/// full size).
+fn split_of(p: &Prepared, r: &Recipe, planes: &[&[f32]], bare: &[&[f32]]) -> Option<Split> {
+    let coef = coefficients_starless(p, r)?;
+    let names = p.names();
+    let h = names.iter().position(|c| c == "H").or(names.iter().position(|c| c == "S"))?;
+    let ch = &p.channels[h];
+    let noise = if ch.stats.sky_noise > 0.0 { ch.stats.sky_noise } else { ch.noise_full as f64 };
+    let curve = stars::Curve::new(noise, r.stretch.clip, r.stretch.background, r.stars.size, r.stars.brightness);
+    let floor = planes.iter().zip(bare).map(|(f, b)| STAR_FLOOR_SIGMAS * layer_sigma(f, b)).collect();
+    Some(Split { coef, curve, floor })
 }
 
 /// Star colour constants.
@@ -448,8 +512,10 @@ fn colour(p: &Prepared, r: &Recipe) -> Option<stars::Colour> {
 }
 
 /// Render planes; with `bare` (the same planes without stars) and a
-/// colour, the starless mix plus naturally coloured stars.
-fn render_planes(planes: &[&[f32]], bare: Option<&[&[f32]]>, w: usize, h: usize, coef: &palette::Coef, col: Option<(&stars::Colour, &stars::Paint)>) -> Rgb {
+/// colour, the starless mix plus naturally coloured stars: recoloured in
+/// place, or with `split` the starless image finished on its own and the
+/// star layer screened on.
+fn render_planes(planes: &[&[f32]], bare: Option<&[&[f32]]>, w: usize, h: usize, coef: &palette::Coef, col: Option<(&stars::Colour, &stars::Paint)>, split: Option<&Split>) -> Rgb {
     use rayon::prelude::*;
     let n = w * h;
     let (mut r, mut g, mut b) = (vec![0f32; n], vec![0f32; n], vec![0f32; n]);
@@ -459,6 +525,27 @@ fn render_planes(planes: &[&[f32]], bare: Option<&[&[f32]]>, w: usize, h: usize,
         let e = s + rr.len();
         let ch: Vec<&[f32]> = planes.iter().map(|p| &p[s..e]).collect();
         match (bare, col) {
+            (Some(bare), Some((c, pt))) if split.is_some() => {
+                let sp = split.unwrap();
+                let bc: Vec<&[f32]> = bare.iter().map(|p| &p[s..e]).collect();
+                let len = e - s;
+                // The original under its own stretch gives the colour of
+                // light no measured star explains.
+                let (mut fr, mut fg, mut fb) = (vec![0f32; len], vec![0f32; len], vec![0f32; len]);
+                palette::process(&ch, coef, &mut fr, &mut fg, &mut fb);
+                palette::process(&bc, &sp.coef, rr, gg, bb);
+                for i in 0..len {
+                    let light = |k: usize| {
+                        let v = ch[k][i];
+                        if v <= palette::ZERO_FLOOR { 0.0 } else { (v - bc[k][i] - sp.floor[k]).max(0.0) }
+                    };
+                    let star = |k: usize| pt.flux[k][s + i];
+                    let o = stars::screen([rr[i], gg[i], bb[i]], &light, &star, pt.confidence[s + i], [fr[i], fg[i], fb[i]], c, &sp.curve);
+                    rr[i] = o[0];
+                    gg[i] = o[1];
+                    bb[i] = o[2];
+                }
+            }
             (Some(bare), Some((c, pt))) => {
                 let bc: Vec<&[f32]> = bare.iter().map(|p| &p[s..e]).collect();
                 let len = e - s;
@@ -486,7 +573,8 @@ pub fn render_proxy(p: &Prepared, r: &Recipe) -> Rgb {
     let planes: Vec<&[f32]> = p.channels.iter().map(|c| c.proxy.data.as_slice()).collect();
     let col = colour(p, r);
     let bare: Option<Vec<&[f32]>> = col.as_ref().and_then(|_| p.channels.iter().map(|c| c.starless_proxy.as_ref().map(|i| i.data.as_slice())).collect());
-    render_planes(&planes, bare.as_deref(), w, h, &coef, col.as_ref().zip(p.paint_proxy.as_ref()))
+    let split = bare.as_ref().and_then(|b| split_of(p, r, &planes, b));
+    render_planes(&planes, bare.as_deref(), w, h, &coef, col.as_ref().zip(p.paint_proxy.as_ref()), split.as_ref())
 }
 
 /// Render the 1:1 crop (`Prepared::crop`).
@@ -496,7 +584,8 @@ pub fn render_crop(p: &Prepared, r: &Recipe) -> Rgb {
     let planes: Vec<&[f32]> = p.channels.iter().map(|c| c.crop.data.as_slice()).collect();
     let col = colour(p, r);
     let bare: Option<Vec<&[f32]>> = col.as_ref().and_then(|_| p.channels.iter().map(|c| c.crop_starless.as_ref().map(|i| i.data.as_slice())).collect());
-    render_planes(&planes, bare.as_deref(), w, h, &coef, col.as_ref().zip(p.paint_crop.as_ref()))
+    let split = bare.as_ref().and_then(|b| split_of(p, r, &planes, b));
+    render_planes(&planes, bare.as_deref(), w, h, &coef, col.as_ref().zip(p.paint_crop.as_ref()), split.as_ref())
 }
 
 /// The starless picture alone (proxy), for showing what the stars sit on.
@@ -504,10 +593,10 @@ pub fn render_starless(p: &Prepared, r: &Recipe) -> Option<Rgb> {
     if !stars_on(p, r) {
         return None;
     }
-    let coef = coefficients(p, r);
+    let coef = coefficients_starless(p, r).unwrap_or_else(|| coefficients(p, r));
     let sp: Vec<&[f32]> = p.channels.iter().map(|c| c.starless_proxy.as_ref().map(|i| i.data.as_slice())).collect::<Option<_>>()?;
     let first = p.channels[0].starless_proxy.as_ref()?;
-    Some(render_planes(&sp, None, first.width, first.height, &coef, None))
+    Some(render_planes(&sp, None, first.width, first.height, &coef, None, None))
 }
 
 /// Render a small tile (preset previews), from the proxy.
@@ -520,7 +609,8 @@ pub fn render_tile(p: &Prepared, r: &Recipe, max: usize) -> Rgb {
     let bare: Option<Vec<&[f32]>> = bare_imgs.as_ref().map(|v| v.iter().map(|i| i.data.as_slice()).collect());
     let (tw, th) = (small[0].width, small[0].height);
     let pt = col.as_ref().map(|_| stars::paint(&p.star_info, p.channels.len(), tw, th, tw as f32 / p.width.max(1) as f32, 0.0, 0.0));
-    render_planes(&planes, bare.as_deref(), tw, th, &coef, col.as_ref().zip(pt.as_ref()))
+    let split = bare.as_ref().and_then(|b| split_of(p, r, &planes, b));
+    render_planes(&planes, bare.as_deref(), tw, th, &coef, col.as_ref().zip(pt.as_ref()), split.as_ref())
 }
 
 /// Render at full resolution (needs `prepare(.., keep_full = true)`),
@@ -530,7 +620,12 @@ pub fn render_full(p: &Prepared, r: &Recipe) -> Result<Rgb> {
     let planes: Vec<&[f32]> = p.channels.iter().map(|c| c.full.as_ref().map(|i| i.data.as_slice())).collect::<Option<_>>().ok_or_else(|| anyhow::anyhow!("full-resolution channels weren't kept"))?;
     let col = colour(p, r);
     let bare: Option<Vec<&[f32]>> = col.as_ref().and_then(|_| p.channels.iter().map(|c| c.starless.as_ref().map(|i| i.data.as_slice())).collect());
-    let rgb = render_planes(&planes, bare.as_deref(), p.width, p.height, &coef, col.as_ref().zip(p.paint_full.as_ref()));
+    // The floor from the 1:1 crop: the same resolution, a fraction of the
+    // pixels.
+    let crop: Vec<&[f32]> = p.channels.iter().map(|c| c.crop.data.as_slice()).collect();
+    let crop_bare: Option<Vec<&[f32]>> = p.channels.iter().map(|c| c.crop_starless.as_ref().map(|i| i.data.as_slice())).collect();
+    let split = bare.as_ref().and(crop_bare.as_ref()).and_then(|b| split_of(p, r, &crop, b));
+    let rgb = render_planes(&planes, bare.as_deref(), p.width, p.height, &coef, col.as_ref().zip(p.paint_full.as_ref()), split.as_ref());
     Ok(match &r.crop {
         Some(c) if !c.is_whole() => rgb.cropped(c),
         _ => rgb,

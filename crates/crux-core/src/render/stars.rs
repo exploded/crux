@@ -28,6 +28,17 @@
 //!    blue, as a blackbody does (lower gives cyan stars). Doubtful stars
 //!    (low SNR, flat like a nebula knot) and nebula under a star barely
 //!    change, and disc edges, where the star adds nothing, can't show.
+//!
+//! **Stretched separately** (`StarSettings::separate`, the default; James's
+//! PixInsight way): steps 3–5 change. The starless channels get the whole
+//! palette (mix, stretch, finishing) from their own statistics, so the
+//! nebula is stretched as nebula. The star layer is each channel's
+//! `max(original − starless, 0)` above the layer's noise floor, coloured one
+//! colour per star as above (doubtful stars take the palette's colour), and
+//! stretched by its own curve (`Curve`: a star on dark sky as the mixer's
+//! stretch would show it, with `size` setting how hard), then screened onto
+//! the finished starless image: `1 − (1 − starless)(1 − stars)`. Stars over
+//! bright nebula keep their brightness instead of being compressed with it.
 
 use crate::image::Image;
 use rayon::prelude::*;
@@ -58,6 +69,15 @@ pub struct StarSettings {
     pub sigma: f64,
     /// How the starless channels are made.
     pub engine: StarEngine,
+    /// Stretch the starless image and the stars separately, then screen
+    /// the stars on (false: one stretch for both, stars recoloured in place).
+    pub separate: bool,
+    /// Separate stretch: how hard the star layer is stretched (1 = a star on
+    /// dark sky as the nebula stretch would show it; lower gives smaller,
+    /// fainter stars).
+    pub size: f64,
+    /// Separate stretch: star layer brightness (1 = as stretched).
+    pub brightness: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -70,9 +90,12 @@ pub enum StarEngine {
     Network,
 }
 
+/// The star layer's default stretch (`StarSettings::size`).
+pub const DEFAULT_SIZE: f64 = 0.6;
+
 impl Default for StarSettings {
     fn default() -> Self {
-        StarSettings { mode: StarMode::Natural, ha_to_green: 0.5, saturation: 1.0, grow: 1.0, sigma: 4.0, engine: StarEngine::Classic }
+        StarSettings { mode: StarMode::Natural, ha_to_green: 0.5, saturation: 1.0, grow: 1.0, sigma: 4.0, engine: StarEngine::Classic, separate: true, size: DEFAULT_SIZE, brightness: 1.0 }
     }
 }
 
@@ -473,34 +496,106 @@ pub fn combine(full: [f32; 3], bare: [f32; 3], lin: &dyn Fn(usize) -> f32, conf:
     if a <= 0.0 {
         return full;
     }
+    // Same brightness; the star part takes the star's colour.
+    let col = unclipped(colour_of(lin, c), yf);
+    std::array::from_fn(|k| ((1.0 - a) * full[k] + a * yf * col[k]).clamp(0.0, 1.0))
+}
+
+/// Linear R, G, B of star light, NBtoRGB-style: R = Ha (½Ha + ½SII with
+/// SII), B = OIII, green between them (from red, not Ha: with weak SII in
+/// red, green from Ha would outshine both and give green "stars").
+#[inline]
+pub fn rgb_of(lin: &dyn Fn(usize) -> f32, c: &Colour) -> [f32; 3] {
     let h = lin(c.h).max(0.0);
     let o = lin(c.o).max(0.0) * c.gain_o;
     let r = match c.s {
         Some(si) => 0.5 * h + 0.5 * lin(si).max(0.0) * c.gain_s,
         None => h,
     };
-    // Green between red and blue (from red, not Ha: with weak SII in red,
-    // green from Ha would outshine both and give green "stars").
-    let g = c.ha_to_green * r + (1.0 - c.ha_to_green) * o;
-    let b = o;
-    let mean = (r + g + b) / 3.0;
-    let mut col = [1.0f32; 3];
+    [r, c.ha_to_green * r + (1.0 - c.ha_to_green) * o, o]
+}
+
+/// A star's colour with mean 1, saturation applied (white when it has no
+/// light).
+#[inline]
+pub fn colour_of(lin: &dyn Fn(usize) -> f32, c: &Colour) -> [f32; 3] {
+    let v = rgb_of(lin, c);
+    let mean = (v[0] + v[1] + v[2]) / 3.0;
     if mean > 0.0 {
-        for (k, v) in [r, g, b].into_iter().enumerate() {
-            col[k] = (1.0 + c.saturation * (v / mean - 1.0)).max(0.0);
-        }
+        std::array::from_fn(|k| (1.0 + c.saturation * (v[k] / mean - 1.0)).max(0.0))
+    } else {
+        [1.0; 3]
     }
-    // Same brightness; the star part takes the star's colour, desaturated
-    // as far as needed so no channel clips (clipping one channel swings the
-    // hue: a blue star's core turned cyan). Bright cores go white.
+}
+
+/// Desaturate a mean-1 colour just enough that `y · colour` doesn't clip
+/// (clipping one channel swings the hue: a blue star's core turned cyan).
+/// Bright cores go white.
+#[inline]
+pub fn unclipped(mut col: [f32; 3], y: f32) -> [f32; 3] {
     let top = col[0].max(col[1]).max(col[2]);
-    if top > 1.0 && yf * top > 1.0 {
-        let s = ((1.0 / yf - 1.0) / (top - 1.0)).clamp(0.0, 1.0);
+    if top > 1.0 && y * top > 1.0 {
+        let s = ((1.0 / y - 1.0) / (top - 1.0)).clamp(0.0, 1.0);
         for v in col.iter_mut() {
             *v = 1.0 + s * (*v - 1.0);
         }
     }
-    std::array::from_fn(|k| ((1.0 - a) * full[k] + a * yf * col[k]).clamp(0.0, 1.0))
+    col
+}
+
+/// The star layer's stretch when stretched separately: a star of linear
+/// light `I` on dark sky, as the mixer's stretch shows it above the sky.
+/// The sky sits `clip` noise sigmas above the black point (`x0`) and goes
+/// to `b` (the background level × `size`), so a smaller size stretches
+/// less: smaller, fainter stars.
+#[derive(Debug, Clone, Copy)]
+pub struct Curve {
+    pub x0: f64,
+    pub m: f64,
+    pub b: f64,
+    pub brightness: f32,
+}
+
+impl Curve {
+    /// `noise`: the reference channel's noise σ (linear, full resolution).
+    pub fn new(noise: f64, clip: f64, background: f64, size: f64, brightness: f64) -> Curve {
+        let x0 = (clip.max(0.5) * noise.max(1.0e-7)).min(0.5);
+        let b = (background * size).clamp(0.005, 0.45);
+        Curve { x0, m: super::palette::mtf(b, x0), b, brightness: brightness.max(0.0) as f32 }
+    }
+
+    #[inline]
+    pub fn apply(&self, light: f32) -> f32 {
+        if light <= 0.0 {
+            return 0.0;
+        }
+        let y = (super::palette::mtf(self.m, (self.x0 + light as f64).min(1.0)) - self.b) / (1.0 - self.b);
+        (y.max(0.0) as f32 * self.brightness).min(1.0)
+    }
+}
+
+/// One pixel of the separate stretch. `base`: the finished starless pixel;
+/// `light`: the star layer's linear light per channel (above its floor);
+/// `star`: the painted star's light, with `conf` its confidence (0 where no
+/// measured star covers the pixel); `hue`: the palette's colour of the
+/// original pixel, for light no measured star explains (doubtful stars,
+/// nebula knots the starless lost).
+#[inline]
+pub fn screen(base: [f32; 3], light: &dyn Fn(usize) -> f32, star: &dyn Fn(usize) -> f32, conf: f32, hue: [f32; 3], c: &Colour, curve: &Curve) -> [f32; 3] {
+    let v = rgb_of(light, c);
+    let y = curve.apply((v[0] + v[1] + v[2]) / 3.0);
+    if y <= 0.0 {
+        return base;
+    }
+    let conf = conf.clamp(0.0, 1.0);
+    let sc = if conf > 0.0 { colour_of(star, c) } else { [1.0; 3] };
+    let hm = (hue[0] + hue[1] + hue[2]) / 3.0;
+    let hc: [f32; 3] = if hm > 1.0e-4 { std::array::from_fn(|k| hue[k] / hm) } else { [1.0; 3] };
+    let col = unclipped(std::array::from_fn(|k| conf * sc[k] + (1.0 - conf) * hc[k]), y);
+    std::array::from_fn(|k| {
+        let s = (y * col[k]).clamp(0.0, 1.0);
+        (1.0 - (1.0 - base[k]) * (1.0 - s)).clamp(0.0, 1.0)
+    })
 }
 
 #[cfg(test)]
@@ -543,5 +638,31 @@ mod tests {
         assert_eq!(none, [0.2, 0.2, 0.2]);
         // A doubtful star keeps the mixed pixel.
         assert_eq!(combine([0.8, 0.5, 0.7], [0.2, 0.2, 0.2], &lin, 0.0, &c), [0.8, 0.5, 0.7]);
+    }
+
+    #[test]
+    fn separate_stars_screen_onto_the_starless_image() {
+        let c = Colour { h: 0, o: 1, s: None, gain_o: 2.0, gain_s: 1.0, ha_to_green: 0.5, saturation: 1.0 };
+        let curve = Curve::new(1.0e-3, 2.8, 0.15, 1.0, 1.0);
+        // No star light: the starless pixel unchanged.
+        let base = [0.3, 0.2, 0.25];
+        assert_eq!(screen(base, &|_| 0.0, &|_| 0.0, 0.0, [0.5; 3], &c, &curve), base);
+        // The curve rises with light, from 0, and never passes 1.
+        assert_eq!(curve.apply(0.0), 0.0);
+        let (a, b, d) = (curve.apply(1.0e-3), curve.apply(1.0e-2), curve.apply(0.5));
+        assert!(0.0 < a && a < b && b < d && d <= 1.0, "{a} {b} {d}");
+        // A smaller size gives fainter stars.
+        assert!(Curve::new(1.0e-3, 2.8, 0.15, 0.5, 1.0).apply(1.0e-2) < b);
+        // A median star (OIII half its Ha) comes out white and screened.
+        let lin = |i: usize| if i == 0 { 0.01 } else { 0.005 };
+        let out = screen(base, &lin, &lin, 1.0, [1.0, 0.0, 0.0], &c, &curve);
+        let y = curve.apply(0.01);
+        for k in 0..3 {
+            let want = 1.0 - (1.0 - base[k]) * (1.0 - y);
+            assert!((out[k] - want).abs() < 1e-5, "{k}: {} vs {want}", out[k]);
+        }
+        // Light no measured star explains takes the palette's hue.
+        let red = screen([0.0; 3], &lin, &|_| 0.0, 0.0, [0.6, 0.2, 0.1], &c, &curve);
+        assert!(red[0] > red[1] && red[1] > red[2], "{red:?}");
     }
 }

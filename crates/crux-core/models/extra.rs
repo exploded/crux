@@ -2,7 +2,7 @@
 // Each returns (ONNX bytes, JSON metadata, version tag for caches).
 
 fn builtin_sharpen() -> Option<(&'static [u8], &'static str, &'static str)> {
-    Some((include_bytes!("sharpen-2.onnx"), include_str!("sharpen-2.json"), "sharpen-2"))
+    Some((include_bytes!("sharpen-3.onnx"), include_str!("sharpen-3.json"), "sharpen-3"))
 }
 
 fn builtin_starless() -> Option<(&'static [u8], &'static str, &'static str)> {
