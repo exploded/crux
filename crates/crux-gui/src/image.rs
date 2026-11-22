@@ -1169,7 +1169,7 @@ fn enhance_view(ui: &mut Ui, a: &mut UiState, p: &Pal) {
         let msg = match (&img.error, &img.enh_error, &img.preparing, &img.progress) {
             (Some(e), _, _, _) => format!("Couldn't prepare the masters: {e}"),
             (_, Some(e), _, _) => format!("Couldn't show the masters: {e}"),
-            (_, _, Some(_), Some(t)) => format!("Sharpening and denoising: {t}. The first run on a target takes about half a minute per master; after that it's kept."),
+            (_, _, Some(_), Some(t)) => format!("Sharpening and denoising: {t}. The first run on a target takes about half a minute per master."),
             _ => "Reading the masters…".into(),
         };
         ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, msg, body(13.0), p.muted);
@@ -1507,7 +1507,7 @@ fn settings(ui: &mut Ui, a: &mut UiState, p: &Pal) {
                         if w::chip(ui, p, "Classic fill", None, r.stars.engine == render::stars::StarEngine::Classic).on_hover_text("Fills each star disc from its surroundings, with matching noise.").clicked() {
                             r.stars.engine = render::stars::StarEngine::Classic;
                         }
-                        let resp = ui.add_enabled_ui(ok.is_ok(), |ui| w::chip(ui, p, "Star remover", None, r.stars.engine == render::stars::StarEngine::Network)).inner.on_hover_text("crux's star remover network: cleaner around bright stars and over nebula. The first run takes a minute or two per master; after that it's kept.");
+                        let resp = ui.add_enabled_ui(ok.is_ok(), |ui| w::chip(ui, p, "Star remover", None, r.stars.engine == render::stars::StarEngine::Network)).inner.on_hover_text("crux's star remover network: cleaner around bright stars and over nebula. The first run takes a minute or two per master.");
                         let resp = if let Err(why) = &ok { resp.on_disabled_hover_text(why.clone()) } else { resp };
                         if resp.clicked() {
                             r.stars.engine = render::stars::StarEngine::Network;
