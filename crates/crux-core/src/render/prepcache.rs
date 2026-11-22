@@ -20,7 +20,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Bump whenever `prepare` produces different results.
-pub const VERSION: u32 = 12;
+pub const VERSION: u32 = 17;
 const MAGIC: &[u8; 8] = b"CRUXPREP";
 
 /// Where a target's prepared cache lives.

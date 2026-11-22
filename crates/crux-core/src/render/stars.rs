@@ -407,6 +407,8 @@ pub fn mask(discs: &[Disc], w: usize, h: usize) -> Vec<f32> {
 const GLOW_STARS: usize = 400;
 /// A star's glow is looked for out to this many disc radii.
 const GLOW_REACH: f32 = 8.0;
+/// A glow brighter than this share of its star's own light is nebula.
+const GLOW_MAX_RATIO: f32 = 0.02;
 
 /// Take the round glows the starless image keeps around bright stars out of
 /// it (they go to the star layer instead, with the star's colour). Per star
@@ -415,16 +417,33 @@ const GLOW_REACH: f32 = 8.0;
 /// alone, so nebula crossing a star stays. Narrowband glows differ by
 /// filter (OIII and SII glows are wider than Ha's), so in a palette they
 /// came out coloured (SHO: magenta halos).
-pub fn remove_glows(sl: &mut Image, orig: &Image, discs: &[Disc], noise: f32) {
+/// One star's glow in one channel's starless image.
+struct GlowFit {
+    /// Index into the discs.
+    i: usize,
+    /// More glow than a star's own (nebula the star sits in).
+    nebula: bool,
+    /// Too faint to bother with.
+    weak: bool,
+    /// The glow per radius, falling outwards, zero at the reach.
+    ex: Vec<f32>,
+    bg: f32,
+    reach: f32,
+}
+
+/// Measure the glows of the brightest stars (see [`remove_glows`]).
+fn glow_fits(sl: &Image, orig: &Image, discs: &[Disc], noise: f32) -> Vec<GlowFit> {
     let (w, h) = (sl.width, sl.height);
     if (orig.width, orig.height) != (w, h) || noise <= 0.0 {
-        return;
+        return Vec::new();
     }
     let at = |img: &Image, x: f32, y: f32| img.data[(y as usize).min(h - 1) * w + (x as usize).min(w - 1)];
-    let mut bright: Vec<(f32, &Disc)> = discs.iter().map(|d| (at(orig, d.x, d.y) - at(sl, d.x, d.y), d)).filter(|(c, _)| *c > 50.0 * noise).collect();
+    let mut bright: Vec<(f32, usize)> = discs.iter().enumerate().map(|(i, d)| (at(orig, d.x, d.y) - at(sl, d.x, d.y), i)).filter(|(c, _)| *c > 50.0 * noise).collect();
     bright.sort_by(|a, b| b.0.total_cmp(&a.0));
     bright.truncate(GLOW_STARS);
-    for (_, d) in bright {
+    let mut fits = Vec::with_capacity(bright.len());
+    for (c, i) in bright {
+        let d = &discs[i];
         let reach = (GLOW_REACH * d.r).clamp(16.0, 160.0);
         let outer = reach * 1.3;
         let n = reach.ceil() as usize;
@@ -452,8 +471,13 @@ pub fn remove_glows(sl: &mut Image, orig: &Image, discs: &[Disc], noise: f32) {
         // From the brightest radius near the centre outwards it may only
         // fall: a nebula bump further out is left alone.
         let k0 = (0..((d.r.ceil() as usize).max(3)).min(n)).max_by(|a, b| e[*a].total_cmp(&e[*b])).unwrap_or(0);
-        if e[k0] < 2.0 * noise {
-            continue;
+        // A star's own glow is faint beside the star (at most 0.6% on
+        // RCW 14); far more is nebula the star sits in (M 42's Trapezium:
+        // 50×; NGC 6164: 5%), which stays. Judged just outside the disc:
+        // nebula crossing the star fills the innermost rings.
+        let edge = e[(d.r.ceil() as usize).min(n)];
+        if std::env::var_os("CRUX_GLOW_DEBUG").is_some() {
+            eprintln!("glow {:.0},{:.0} r {:.1} star {:.5} glow {:.5} ratio {:.3} reach {:.0}", d.x, d.y, d.r, c, edge, edge / c.max(1e-9), reach);
         }
         let mut ex = vec![0f32; n + 1];
         let mut run = e[k0];
@@ -461,20 +485,55 @@ pub fn remove_glows(sl: &mut Image, orig: &Image, discs: &[Disc], noise: f32) {
             if k > k0 {
                 run = run.min(e[k]);
             }
-            ex[k] = run;
+            ex[k] = run * (1.0 - (k as f32 / reach).min(1.0).powi(2));
         }
-        for k in 0..=n {
-            ex[k] *= 1.0 - (k as f32 / reach).min(1.0).powi(2);
+        fits.push(GlowFit { i, nebula: edge > GLOW_MAX_RATIO * c, weak: e[k0] < 2.0 * noise, ex, bg, reach });
+    }
+    fits
+}
+
+/// Per disc: does this channel see more glow than a star's own (nebula
+/// the star sits in)? Combine the channels' answers (any) before
+/// [`remove_glows`], so every channel keeps or loses a star's glow
+/// together: a saturated core makes the glow look large beside it in that
+/// channel alone, and taking the glow from only some channels coloured the
+/// halo (cyan on a DSLR's saturated stars).
+pub fn glow_nebula(sl: &Image, orig: &Image, discs: &[Disc], noise: f32) -> Vec<bool> {
+    let mut v = vec![false; discs.len()];
+    for f in glow_fits(sl, orig, discs, noise) {
+        v[f.i] = f.nebula;
+    }
+    v
+}
+
+/// Take the round glows the starless image keeps around bright stars out of
+/// it (they go to the star layer instead, with the star's colour). Per star
+/// the glow is the starless image's median at each radius over the median
+/// of a ring just outside, kept only while it falls outwards: the round part
+/// alone, so nebula crossing a star stays. Narrowband glows differ by
+/// filter (OIII and SII glows are wider than Ha's), so in a palette they
+/// came out coloured (SHO: magenta halos). `keep`: per disc, leave its glow
+/// (from [`glow_nebula`] over every channel).
+pub fn remove_glows(sl: &mut Image, orig: &Image, discs: &[Disc], noise: f32, keep: &[bool]) {
+    let w = sl.width;
+    let h = sl.height;
+    for f in glow_fits(sl, orig, discs, noise) {
+        if f.nebula || f.weak || keep.get(f.i).copied().unwrap_or(false) {
+            continue;
         }
+        let d = &discs[f.i];
+        let n = f.ex.len() - 1;
+        let (xa, xb) = ((d.x - f.reach).floor().max(0.0) as usize, ((d.x + f.reach).ceil() as usize).min(w - 1));
+        let (ya, yb) = ((d.y - f.reach).floor().max(0.0) as usize, ((d.y + f.reach).ceil() as usize).min(h - 1));
         for y in ya..=yb {
             for x in xa..=xb {
                 let r = ((x as f32 + 0.5 - d.x).powi(2) + (y as f32 + 0.5 - d.y).powi(2)).sqrt();
-                if r < reach {
+                if r < f.reach {
                     let k = r as usize;
-                    let f = r - k as f32;
-                    let e = ex[k] * (1.0 - f) + ex[(k + 1).min(n)] * f;
+                    let t = r - k as f32;
+                    let e = f.ex[k.min(n)] * (1.0 - t) + f.ex[(k + 1).min(n)] * t;
                     let i = y * w + x;
-                    sl.data[i] = (sl.data[i] - e).max(bg.min(sl.data[i]));
+                    sl.data[i] = (sl.data[i] - e).max(f.bg.min(sl.data[i]));
                 }
             }
         }
@@ -726,14 +785,14 @@ mod tests {
                 let r2 = (x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2);
                 // Sky, a nebula band crossing the star, and the glow.
                 let band = if (y as f32 - 150.0).abs() < 4.0 { 0.02 } else { 0.0 };
-                let v = 0.1 + band + 0.02 * (-r2 / (2.0 * 12.0f32.powi(2))).exp() + noise();
+                let v = 0.1 + band + 0.01 * (-r2 / (2.0 * 12.0f32.powi(2))).exp() + noise();
                 sl.data[y * w + x] = v;
                 orig.data[y * w + x] = v + 0.8 * (-r2 / (2.0 * 2.0f32.powi(2))).exp();
             }
         }
         let disc = Disc { x: cx, y: cy, r: 6.0, peaked: 3.0 };
-        remove_glows(&mut sl, &orig, &[disc], 0.0006);
-        // The glow goes (4 px from the star, off the band) …
+        remove_glows(&mut sl, &orig, &[disc], 0.0006, &[false]);
+        // The glow (1.25% of the star) goes, 4 px from the star, off the band …
         assert!((sl.get(154, 135) - 0.1).abs() < 0.004, "glow left: {}", sl.get(154, 135));
         // … the band crossing it stays, and so does the far sky.
         assert!(sl.get(130, 150) - 0.1 > 0.015, "band lost: {}", sl.get(130, 150));

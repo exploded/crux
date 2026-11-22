@@ -717,7 +717,7 @@ mod tests {
         let mix = Mix { preset: String::new(), balance: Balance::None, weights: [("H".to_string(), [1.0, 0.6, 0.3])].into_iter().collect() };
         let fin = Finishing { luminance: 0.0, green: 0.0, saturation: 1.0, detail: 0.0, chroma: 0.0, neutral: 0.0 };
         let run = |h: f64| {
-            let st = Stretching { highlights: h, ..Default::default() };
+            let st = Stretching { highlights: h, background: 0.15, ..Default::default() };
             let c = coefficients(&ch, &[&s], None, &mix, &st, &fin);
             let (mut r, mut g, mut b) = (vec![0f32; px.len()], vec![0f32; px.len()], vec![0f32; px.len()]);
             process(&[&px], &c, &mut r, &mut g, &mut b);
@@ -772,7 +772,7 @@ mod tests {
 
     #[test]
     fn frame_filling_targets_stretch_from_the_darkest_structure() {
-        let st = Stretching::default();
+        let st = Stretching { background: 0.15, ..Default::default() };
         let noise = 1.0e-4;
         // Sky-dominated: MAD sigma = noise, darkest structure 0.5σ under the
         // sky. The mixer's stretch is kept exactly.

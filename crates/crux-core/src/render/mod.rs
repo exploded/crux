@@ -352,7 +352,10 @@ pub fn prepare(t: &Target, g: &GradientSettings, st: &stars::StarSettings, keep_
     };
     // Each channel's statistics, noise and starless copy, every channel at
     // once (one after another this was 8.6 s of IC 434's 13 s).
-    let per_channel: Vec<_> = {
+    // First every channel's statistics and starless copy, then the stars
+    // whose glows are nebula in any channel (decided together, so a halo
+    // never loses its glow in some channels only), then the glows out.
+    let first: Vec<_> = {
         use rayon::prelude::*;
         corrected
             .into_par_iter()
@@ -379,9 +382,25 @@ pub fn prepare(t: &Target, g: &GradientSettings, st: &stars::StarSettings, keep_
                         }
                         s
                     });
-                let sl = mask.as_ref().map(|mk| {
-                    let mut s = net_sl.unwrap_or_else(|| stars::starless(&img, mk, noise_full, k as u64 + 1));
-                    stars::remove_glows(&mut s, &img, &discs, noise_full);
+                let sl = mask.as_ref().map(|mk| net_sl.unwrap_or_else(|| stars::starless(&img, mk, noise_full, k as u64 + 1)));
+                let nebula = sl.as_ref().map(|s| stars::glow_nebula(s, &img, &discs, noise_full)).unwrap_or_default();
+                (m, img, raw_proxy, model, report, px, stats, noise_full, noise_proxy, sl, nebula)
+            })
+            .collect()
+    };
+    let mut keep = vec![false; discs.len()];
+    for f in &first {
+        for (k, v) in keep.iter_mut().zip(&f.10) {
+            *k |= *v;
+        }
+    }
+    let per_channel: Vec<_> = {
+        use rayon::prelude::*;
+        first
+            .into_par_iter()
+            .map(|(m, img, raw_proxy, model, report, px, stats, noise_full, noise_proxy, sl, _)| {
+                let sl = sl.map(|mut s| {
+                    stars::remove_glows(&mut s, &img, &discs, noise_full, &keep);
                     s
                 });
                 let sl_proxy = sl.as_ref().map(|s| proxy(s, PROXY_MAX));
