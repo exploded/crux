@@ -159,11 +159,111 @@ def real_bright_bank(cache: Path, exclude: list[str], radius: int = 64, min_peak
     return out
 
 
+def deep_psf_bank(cache: Path, exclude: list[str], radius: int = 128, min_peak: float = 300.0, max_stars: int = 60, min_stars: int = 8, max_mottle: float = 0.06) -> list[np.ndarray]:
+    """One deep bright-star PSF per denoised master: its bright stars on flat
+    sky cut `2·radius + 1` wide, sky plane removed (fitted on the outer ring), each
+    scaled to the others on its unsaturated pixels, then median-stacked.
+    Neighbouring stars and nebula sit in different places around each star,
+    so the median rejects them and leaves the optics' own halo and long
+    diffraction spikes, far fainter than any single cutout shows cleanly.
+    Normalised to a sum of 1 over 12–40 px."""
+    out = []
+    r = radius
+    yy, xx = np.mgrid[-r : r + 1, -r : r + 1].astype(np.float32)
+    rr = np.sqrt(yy * yy + xx * xx)
+    ring = rr >= 0.9 * r
+    A = np.stack([np.ones(ring.sum()), xx[ring], yy[ring]], 1)
+    fit = (rr >= 4) & (rr <= 40)
+    sector = ((np.arctan2(yy, xx) + math.pi) / (2 * math.pi) * 8).astype(int) % 8
+    ri = rr.astype(int)
+    taper = np.clip((r - rr) / (0.15 * r), 0, 1)
+    taper = (0.5 - 0.5 * np.cos(math.pi * taper)).astype(np.float32)
+    for f in sorted(Path(cache).glob("*.npz")):
+        if any(e.lower() in f.stem.lower() for e in exclude):
+            continue
+        z = np.load(f)
+        img, sky, sigma = z["img"].astype(np.float32), float(z["sky"]), float(z["sigma"])
+        h, w = img.shape
+        sat = 0.95 * float(img.max())
+        t = torch.from_numpy(img)[None, None]
+        mx = F.max_pool2d(t, 7, 1, 3)[0, 0].numpy()
+        ys, xs = np.nonzero((img == mx) & (img > sky + min_peak * sigma))
+        order = np.argsort(-img[ys, xs])
+        cuts, taken = [], []
+        for i in order:
+            y, x = int(ys[i]), int(xs[i])
+            if y < r or x < r or y >= h - r or x >= w - r:
+                continue
+            if any(abs(y - ty) < 24 and abs(x - tx) < 24 for ty, tx in taken):
+                continue
+            cut = img[y - r : y + r + 1, x - r : x + r + 1]
+            # Flat sky only: the outer ring's sectors agree within 1.5σ
+            # after a plane (clipped) is taken off.
+            v = cut[ring].astype(np.float64)
+            keep = np.ones(len(v), bool)
+            for _ in range(3):
+                coef, *_ = np.linalg.lstsq(A[keep], v[keep], rcond=None)
+                res = v - A @ coef
+                s_ = 1.4826 * np.median(np.abs(res[keep] - np.median(res[keep]))) + 1e-12
+                keep = np.abs(res) < 3 * s_
+            med = [np.median(res[(sector[ring] == k) & keep]) for k in range(8) if ((sector[ring] == k) & keep).any()]
+            if len(med) < 8 or max(med) - min(med) > 1.5 * sigma:
+                continue
+            plane = (coef[0] + coef[1] * xx + coef[2] * yy).astype(np.float32)
+            c = cut - plane
+            c[cut >= sat] = np.nan  # saturated: left out of the scaling
+            # Saturated cores in a master can be flat or even dark: when the
+            # radial profile peaks off-centre, everything inside the peak is
+            # left out too.
+            prof = np.bincount(ri.ravel(), np.nan_to_num(c).ravel(), minlength=r + 2)[:30] / np.maximum(np.bincount(ri.ravel(), minlength=r + 2)[:30], 1)
+            rp = int(np.argmax(prof))
+            if rp > 0:
+                c[rr <= rp + 1] = np.nan
+            cuts.append(c)
+            taken.append((y, x))
+            if len(cuts) >= max_stars:
+                break
+        if len(cuts) < min_stars:
+            print(f"  {f.stem}: {len(cuts)} bright stars, too few", flush=True)
+            continue
+        st = np.stack(cuts)
+        # Scale each star to the median on unsaturated pixels 4–40 px out,
+        # twice (the first template from the stars' own 4–40 px sums).
+        scale = np.array([np.nansum(c[fit]) for c in st])
+        tmpl = np.nanmedian(st / scale[:, None, None], 0)
+        for _ in range(2):
+            scale = np.array([np.nanmedian(c[fit] / np.where(tmpl[fit] > 0, tmpl[fit], np.nan)) for c in st])
+            tmpl = np.nanmedian(st / scale[:, None, None], 0)
+        # What's left at the edge is sky the planes missed: take it off.
+        tmpl = tmpl - float(np.nanmedian(tmpl[ring]))
+        # Normalised on the unsaturated ring 12–40 px out; centres saturated
+        # in every star are filled well above the brightest value, so a
+        # pasted star saturates there (the batch clips at 1).
+        tot = float(np.nansum(tmpl[fit & (rr >= 12)]))
+        if not np.isfinite(tot) or tot <= 0:
+            continue
+        # Too much left 60–115 px out besides the star's own (round) light:
+        # nebula or crowding the median couldn't reject.
+        prof = np.bincount(ri.ravel(), np.nan_to_num(tmpl).ravel()) / np.maximum(np.bincount(ri.ravel()), 1)
+        far = (rr >= 60) & (rr < 115)
+        mottle = float(np.nanstd((tmpl - prof[ri])[far])) / max(float(np.nanmean(tmpl[(rr >= 12) & (rr < 16)])), 1e-30)
+        if mottle > max_mottle:
+            print(f"  {f.stem}: {len(cuts)} bright stars, too mottled ({mottle:.3f})", flush=True)
+            continue
+        tmpl = np.nan_to_num(tmpl, nan=3.0 * float(np.nanmax(tmpl)))
+        tmpl = np.maximum(tmpl, 0) * taper
+        out.append((tmpl / tot).astype(np.float32))
+        print(f"  {f.stem}: deep PSF from {len(cuts)} bright stars (mottle {mottle:.3f})", flush=True)
+    return out
+
+
 MAX_PEAK = 3000.0  # brightest star peak, noise σ
 BRIGHT = False  # add halos and diffraction spikes to bright stars
 P_BRIGHT = 1.0  # share of patches that get them
 REAL: list[np.ndarray] = []  # real bright stars (`real_bright_bank`)
 P_REAL = 0.0  # share of patches that get one to three of them
+DEEP: list[np.ndarray] = []  # deep bright-star PSFs (`deep_psf_bank`)
+P_DEEP = 0.0  # share of patches that get one or two
 
 
 def bright(stars: np.ndarray, y0: int, x0: int, peak: float, fw: float, angle: float, rng: random.Random):
@@ -238,6 +338,21 @@ def batch(bgs, psfs, bank, n, rng, device):
                 yb, xb = min(c, cy + sh), min(c, cx + sh)
                 if yb > ya and xb > xa:
                     stars[ya:yb, xa:xb] += rng.uniform(0.3, 1.2) * st[ya - cy : yb - cy, xa - cx : xb - cx]
+        if DEEP and rng.random() < P_DEEP:
+            for _ in range(rng.choice([1, 1, 2])):
+                st = np.rot90(rng.choice(DEEP), rng.randrange(4))
+                if rng.random() < 0.5:
+                    st = st[:, ::-1]
+                sh = st.shape[0]
+                # Peak (unsaturated equivalent) 500–50,000σ: the core
+                # saturates in most; halo and spikes scale with it.
+                top = float(st[sh // 2 - 2 : sh // 2 + 3, sh // 2 - 2 : sh // 2 + 3].max()) / 3.0
+                amp = math.exp(rng.uniform(math.log(500), math.log(50000))) * sigma0 / max(top, 1e-12)
+                ccy, ccx = rng.randrange(c), rng.randrange(c)  # centre inside the patch
+                cy, cx = ccy - sh // 2, ccx - sh // 2
+                ya, xa = max(0, cy), max(0, cx)
+                yb, xb = min(c, cy + sh), min(c, cx + sh)
+                stars[ya:yb, xa:xb] += amp * st[ya - cy : yb - cy, xa - cx : xb - cx]
         img = np.minimum(bg + stars, 1.0)
         t = torch.from_numpy(np.stack([img, bg]))[None].to(device)
         if f > 1.0:
@@ -282,8 +397,10 @@ def main():
     ap.add_argument("--p-real", type=float, default=0.4, help="share of patches with real bright stars")
     ap.add_argument("--real-radius", type=int, default=64, help="real bright star cutout radius, px")
     ap.add_argument("--real-floor", type=float, default=1.5, help="light under this many noise σ is cut from real bright stars")
+    ap.add_argument("--deep", type=Path, help="denoised masters (deconv.py's cache) to median-stack deep bright-star PSFs from (halos, long spikes)")
+    ap.add_argument("--p-deep", type=float, default=0.3, help="share of patches with a deep bright-star PSF")
     args = ap.parse_args()
-    global MAX_PEAK, BRIGHT, P_BRIGHT, REAL, P_REAL
+    global MAX_PEAK, BRIGHT, P_BRIGHT, REAL, P_REAL, DEEP, P_DEEP
     MAX_PEAK, BRIGHT, P_BRIGHT = args.max_peak, args.bright, args.p_bright
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
@@ -293,9 +410,12 @@ def main():
     if args.real_bright:
         print("real bright stars:", flush=True)
         REAL, P_REAL = real_bright_bank(args.real_bright, args.exclude, radius=args.real_radius, floor=args.real_floor), args.p_real
+    if args.deep:
+        print("deep bright-star PSFs:", flush=True)
+        DEEP, P_DEEP = deep_psf_bank(args.deep, args.exclude), args.p_deep
     psfs = psf_bank(args.bundles, args.exclude)
     bank = noise_bank(args.bundles, args.exclude)
-    print(f"{len(bgs)} backgrounds, {len(psfs)} star stamps, {len(REAL)} real bright stars, {len(bank)} noise patches", flush=True)
+    print(f"{len(bgs)} backgrounds, {len(psfs)} star stamps, {len(REAL)} real bright stars, {len(DEEP)} deep PSFs, {len(bank)} noise patches", flush=True)
     vrng = random.Random(999)
     val = [batch(bgs, psfs, bank, args.batch, vrng, device) for _ in range(8)]
     net = UNet(base=args.base, depth=args.depth, inputs=2).to(device)
@@ -330,7 +450,7 @@ def main():
     meta = {"format": "crux-starless", "version": 1, "k": 3.0, "fwhm_scale": FWHM_SCALE, "multiple": 2 ** args.depth * 2,
             "inputs": ["asinh((v - sky) / (k * noise))", "fwhm / fwhm_scale"],
             "backgrounds": [g.name for g in bgs], "iters": args.iters, "parameters": parameters(net),
-            "max_peak": MAX_PEAK, "bright": BRIGHT, "real_bright": len(REAL), "p_real": P_REAL, "real_radius": args.real_radius, "real_floor": args.real_floor}
+            "max_peak": MAX_PEAK, "bright": BRIGHT, "real_bright": len(REAL), "p_real": P_REAL, "real_radius": args.real_radius, "real_floor": args.real_floor, "deep_psfs": len(DEEP), "p_deep": P_DEEP}
     (args.out / "starless.json").write_text(json.dumps(finite(meta), indent=1, allow_nan=False), encoding="utf-8")
     print("exported", args.out / "starless.onnx", flush=True)
 
