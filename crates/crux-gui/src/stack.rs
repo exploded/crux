@@ -812,16 +812,19 @@ fn header(ui: &mut Ui, a: &mut UiState, s: &Session, p: &Pal) {
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if let Some(out) = a.stack.plan.as_ref().map(|pl| pl.out.clone()) {
-                if a.stack.running.is_none() && a.stack.report.is_some() && w::button(ui, p, "Open output folder", Kind::Ghost, None).clicked() {
+                if a.stack.running.is_none() && a.stack.mos.running.is_none() && a.stack.report.is_some() && w::button(ui, p, "Open output folder", Kind::Ghost, None).clicked() {
                     let _ = open_folder(&out);
                 }
             }
         });
     });
+    let steps = process_steps(a, s);
+    let mosaic = mosaic_step_running(a, &steps);
     match &a.stack.report {
         Some(Ok(r)) => {
             ui.add_space(6.0);
-            let mut t = format!("Done in {:.0} s: {} processed, {} already up to date", r.seconds, r.processed, r.up_to_date);
+            let done = if mosaic.is_some() { format!("Steps 1–{} done", steps.len() - 1) } else { "Done".to_string() };
+            let mut t = format!("{done} in {:.0} s: {} processed, {} already up to date", r.seconds, r.processed, r.up_to_date);
             if r.failed > 0 {
                 t.push_str(&format!(", {} failed", r.failed));
             }
@@ -837,7 +840,14 @@ fn header(ui: &mut Ui, a: &mut UiState, s: &Session, p: &Pal) {
             if r.cancelled {
                 t.push_str(" (cancelled)");
             }
-            ui.label(RichText::new(t).color(if r.failed > 0 { p.warn } else { p.good }));
+            let mosaic_failed = steps.contains(&Stage::Mosaic) && a.stack.mos.error.is_some();
+            if let Some(m) = &mosaic {
+                t.push_str(&format!(". Now assembling the mosaic: {m}"));
+            } else if mosaic_failed {
+                t.push_str(&format!(". The mosaic failed: see step {}", steps.len()));
+            }
+            let warn = r.failed > 0 || mosaic.is_some() || mosaic_failed;
+            ui.label(RichText::new(t).color(if warn { p.warn } else { p.good }));
         }
         Some(Err(e)) => {
             ui.label(RichText::new(format!("Processing stopped: {e}")).color(p.rej));
@@ -1042,7 +1052,7 @@ fn stages(ui: &mut Ui, a: &mut UiState, s: &Session, p: &Pal, tx: &Sender<Msg>) 
     for st in first {
         card(ui, a, st);
     }
-    run_button(ui, a, p, steps.len(), tx);
+    run_button(ui, a, p, &steps, tx);
     ui.add_space(8.0);
     w::eyebrow(ui, p, "Optional");
     card(ui, a, Stage::Solve);
@@ -1058,7 +1068,8 @@ fn stages(ui: &mut Ui, a: &mut UiState, s: &Session, p: &Pal, tx: &Sender<Msg>) 
 
 /// The run button under the stacking steps, or Cancel and progress while
 /// they run.
-fn run_button(ui: &mut Ui, a: &mut UiState, p: &Pal, k: usize, tx: &Sender<Msg>) {
+fn run_button(ui: &mut Ui, a: &mut UiState, p: &Pal, steps: &[Stage], tx: &Sender<Msg>) {
+    let k = steps.len();
     ui.add_space(2.0);
     if let Some((done, total, what)) = &a.stack.running {
         let f = if *total > 0 { *done as f32 / *total as f32 } else { 0.0 };
@@ -1067,12 +1078,27 @@ fn run_button(ui: &mut Ui, a: &mut UiState, p: &Pal, k: usize, tx: &Sender<Msg>)
         if w::button(ui, p, "Cancel", Kind::Danger, None).clicked() {
             a.stack.cancel.store(true, Ordering::Relaxed);
         }
+    } else if let Some(r) = mosaic_step_running(a, steps) {
+        // The run's last step: the mosaic, assembled after integrating.
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new().size(12.0).color(p.accent));
+            ui.add(egui::Label::new(RichText::new(format!("Step {k} of {k} · Mosaic · {r}")).font(body(12.0)).color(p.muted)).wrap());
+        });
+        if w::button(ui, p, "Cancel", Kind::Danger, None).clicked() {
+            a.stack.mos.cancel.store(true, Ordering::Relaxed);
+        }
     } else if let Some(n) = a.stack.plan.as_ref().map(|pl| pl.n_lights()) {
         let (label, enabled) = process_label(n, k, a.stack.pending);
         if w::button_enabled(ui, p, &label, Kind::Primary, None, enabled).clicked() {
             a.stack.start_run(tx.clone(), ui.ctx().clone());
         }
     }
+}
+
+/// What the mosaic is doing, when it's running and is one of the run's
+/// steps (it starts once integration ends, as a job of its own).
+fn mosaic_step_running(a: &UiState, steps: &[Stage]) -> Option<String> {
+    if steps.contains(&Stage::Mosaic) { a.stack.mos.running.clone() } else { None }
 }
 
 /// One entry in the step list. Clicking it shows that step on the right

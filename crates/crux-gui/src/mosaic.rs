@@ -190,7 +190,7 @@ fn start(m: &mut MosaicUi, out: &std::path::Path, tx: &Sender<Msg>, ctx: &egui::
 pub fn summary(a: &UiState, p: &Pal) -> (Color32, String) {
     let m = &a.stack.mos;
     if let Some(r) = &m.running {
-        return (p.warn, r.clone());
+        return (p.warn, format!("Running: {r}"));
     }
     if m.groups.is_empty() {
         return (p.faint, "Only for targets shot as panels".into());
