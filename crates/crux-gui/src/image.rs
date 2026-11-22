@@ -329,7 +329,7 @@ fn kept(r: &Recipe) -> Recipe {
 /// The recipe without finishing (Palette stage "after", Finish "before").
 fn unfinished(r: &Recipe) -> Recipe {
     let mut u = r.clone();
-    u.finish = palette::Finishing { luminance: 0.0, green: 0.0, saturation: 1.0 };
+    u.finish = palette::Finishing { luminance: 0.0, green: 0.0, saturation: 1.0, detail: 0.0, chroma: 0.0, neutral: 0.0 };
     u
 }
 
@@ -1057,6 +1057,9 @@ fn src(ui: &mut Ui, p: &Pal, changed: bool, base: &str) {
 
 /// A labelled slider with its source tag; `pct` shows a fraction as %.
 #[allow(clippy::too_many_arguments)]
+/// Image-stage sliders: wide enough that one pixel is a small step.
+const SLIDER_WIDTH: f32 = 300.0;
+
 fn slider(ui: &mut Ui, p: &Pal, label: &str, v: &mut f64, range: std::ops::RangeInclusive<f64>, base: f64, base_label: &str, pct: bool, help: &str) {
     slider_d(ui, p, label, v, range, base, base_label, pct, help, 2)
 }
@@ -1065,16 +1068,19 @@ fn slider(ui: &mut Ui, p: &Pal, label: &str, v: &mut f64, range: std::ops::Range
 fn slider_d(ui: &mut Ui, p: &Pal, label: &str, v: &mut f64, range: std::ops::RangeInclusive<f64>, base: f64, base_label: &str, pct: bool, help: &str, decimals: usize) {
     ui.horizontal(|ui| {
         ui.add_sized([150.0, 20.0], egui::Label::new(RichText::new(label).font(body(13.0)))).on_hover_text(help);
+        // Wide, and no snapping to round numbers while dragging (egui's
+        // smart aim made values jump 45 → 50 → 55): fine adjustments.
+        ui.spacing_mut().slider_width = SLIDER_WIDTH;
         let s = if pct {
             let mut x = *v * 100.0;
             let (a, b) = (*range.start() * 100.0, *range.end() * 100.0);
-            let r = ui.add(egui::Slider::new(&mut x, a..=b).suffix("%").fixed_decimals(0)).on_hover_text(help);
+            let r = ui.add(egui::Slider::new(&mut x, a..=b).suffix("%").fixed_decimals(1).smart_aim(false)).on_hover_text(help);
             if r.changed() {
                 *v = x / 100.0;
             }
             r
         } else {
-            ui.add(egui::Slider::new(v, range).fixed_decimals(decimals)).on_hover_text(help)
+            ui.add(egui::Slider::new(v, range).fixed_decimals(decimals + 1).smart_aim(false)).on_hover_text(help)
         };
         let _ = s;
         src(ui, p, (*v - base).abs() > 1e-9, base_label);
@@ -1397,6 +1403,7 @@ fn settings(ui: &mut Ui, a: &mut UiState, p: &Pal) {
                     ui.add_space(4.0);
                     let mut changed = false;
                     egui::Grid::new("mix").num_columns(4).spacing([12.0, 4.0]).show(ui, |ui| {
+                        ui.spacing_mut().slider_width = 200.0;
                         ui.label("");
                         for (c, n) in [(p.f_r, "Red"), (p.f_g, "Green"), (p.f_b, "Blue")] {
                             ui.label(RichText::new(n).font(semibold(12.0)).color(c));
@@ -1407,7 +1414,7 @@ fn settings(ui: &mut Ui, a: &mut UiState, p: &Pal) {
                             ui.label(RichText::new(n).font(semibold(13.0)));
                             for v in e.iter_mut() {
                                 let mut x = *v * 100.0;
-                                if ui.add(egui::Slider::new(&mut x, 0.0..=200.0).suffix("%").fixed_decimals(0)).changed() {
+                                if ui.add(egui::Slider::new(&mut x, 0.0..=200.0).suffix("%").fixed_decimals(1).smart_aim(false)).changed() {
                                     *v = x / 100.0;
                                     changed = true;
                                 }
@@ -1436,6 +1443,7 @@ fn settings(ui: &mut Ui, a: &mut UiState, p: &Pal) {
                 ui.add_space(4.0);
                 slider(ui, p, "Background", &mut r.stretch.background, 0.03..=0.45, base.stretch.background, &base_label, false, "Brightness of the background after the stretch. Lower leaves room to stretch further later (the mixer's default 0.15; STF uses 0.25).");
                 slider(ui, p, "Black level", &mut r.stretch.black, 0.0..=1.0, base.stretch.black, &base_label, true, "Pulls the background towards black without weakening the stretch of the nebula.");
+                slider(ui, p, "Highlights", &mut r.stretch.highlights, 0.0..=1.0, base.stretch.highlights, &base_label, true, "Holds bright nebula back from white, keeping its colour, so cores stay coloured instead of washing out. Stars aren't affected.");
             }
             if depth == Depth::Expert {
                 slider(ui, p, "Shadow clip σ", &mut r.stretch.clip, 1.0..=20.0, base.stretch.clip, &base_label, false, "How far below the background the black point sits, in noise sigmas.");
@@ -1451,17 +1459,27 @@ fn settings(ui: &mut Ui, a: &mut UiState, p: &Pal) {
             }
         }
         Stage::Stars => {
+            let broadband = img.target().is_some_and(|t| t.kind() == palette::Kind::Broadband);
+            if broadband {
+                w::muted(ui, p, "crux finds each star, takes it out of every master, and stretches the stars on their own: the starless image gets the full stretch, so faint nebula and galaxy halos come up without the stars swelling, and the stars get a gentler stretch screened on top. Each star keeps the colour of its own red, green and blue light, with the median star white. With one stretch, stars and the rest are stretched together, as before.");
+            } else {
             w::muted(ui, p, "The palette boosts OIII and SII to match Ha, and stars have a different profile in each filter, so mixed stars turn pink or magenta. crux finds each star, measures its light in every linear master, and gives it one natural colour from that light (R = Ha, B = OIII, G between them, with the median star white), keeping its size and brightness. This replaces StarXTerminator and NBtoRGB Stars. Stretched separately (the default), the starless image gets its own stretch, mix and finishing, and the stars their own gentler stretch, screened on top; light no measured star explains keeps the mixed colour. With one stretch, only the stars change, and faint or doubtful stars and stars on bright nebula keep the mixed colour.");
+            }
             let possible = img.target().is_some_and(|t| render::stars_possible(&t.channels()));
             if !possible {
-                w::muted(ui, p, "This target isn't narrowband with OIII, so its stars already have their colours.");
+                w::muted(ui, p, "This target has no colour channels to measure star colours from, so its stars stay as they are.");
             } else {
                 if let Some(pp) = &pp {
                     if pp.n_stars > 0 {
                         let names = pp.names();
                         let at = |n: &str| names.iter().position(|c| c == n);
-                        let g = at("O").map(|o| pp.star_gain[o] / at("H").map(|h| pp.star_gain[h]).unwrap_or(1.0)).unwrap_or(1.0);
-                        ui.label(RichText::new(format!("{} stars masked across the channels ({:.1}% of the frame); OIII ×{g:.2} so the median star is white", pp.n_stars, pp.star_cover * 100.0)).font(body(12.5)).color(p.muted));
+                        let gain = if broadband {
+                            let gg = |n: &str| at(n).zip(at("G")).map(|(i, j)| pp.star_gain[i] / pp.star_gain[j]).unwrap_or(1.0);
+                            format!("red ×{:.2}, blue ×{:.2}", gg("R"), gg("B"))
+                        } else {
+                            format!("OIII ×{:.2}", at("O").map(|o| pp.star_gain[o] / at("H").map(|h| pp.star_gain[h]).unwrap_or(1.0)).unwrap_or(1.0))
+                        };
+                        ui.label(RichText::new(format!("{} stars masked across the channels ({:.1}% of the frame); {gain} so the median star is white", pp.n_stars, pp.star_cover * 100.0)).font(body(12.5)).color(p.muted));
                     }
                 }
                 ui.horizontal_wrapped(|ui| {
@@ -1509,12 +1527,15 @@ fn settings(ui: &mut Ui, a: &mut UiState, p: &Pal) {
                         src(ui, p, r.stars.separate != base.stars.separate, &base_label);
                     });
                     if r.stars.separate {
-                        slider(ui, p, "Star size", &mut r.stars.size, 0.1..=1.5, base.stars.size, &base_label, true, "How hard the stars are stretched. 100% shows a star on dark sky as the nebula stretch would; lower gives smaller, fainter stars, mostly by dimming the faint ones and the halos.");
+                        slider(ui, p, "Star size", &mut r.stars.size, 0.05..=1.5, base.stars.size, &base_label, true, "How hard the stars are stretched. 100% shows a star on dark sky as the nebula stretch would; lower gives smaller, fainter stars, mostly by dimming the faint ones and the halos.");
                         slider(ui, p, "Star brightness", &mut r.stars.brightness, 0.0..=1.5, base.stars.brightness, &base_label, true, "100% screens the stretched stars on as they are; 0% leaves the starless image.");
+                        slider_d(ui, p, "Faint star cut", &mut r.stars.faint_cut, 0.0..=30.0, base.stars.faint_cut, &base_label, false, "Star light under this many noise sigmas is left out of the star layer. Raise it to thin out a crowded field's faint stars and halos; the bright stars barely change.", 1);
                     }
                 }
                 if depth != Depth::Auto && r.stars.mode == render::stars::StarMode::Natural {
+                    if !broadband {
                     slider(ui, p, "Red in green", &mut r.stars.ha_to_green, 0.0..=1.0, base.stars.ha_to_green, &base_label, true, "NBtoRGB's ratio: how much of the stars' green comes from red (Ha) rather than blue (OIII). 50% puts green halfway, as in a blackbody; lower gives bluer stars, higher yellower ones.");
+                    }
                     slider(ui, p, "Star saturation", &mut r.stars.saturation, 0.0..=2.0, base.stars.saturation, &base_label, true, "100% is the colour the stars measure.");
                 }
                 if depth == Depth::Expert && r.stars.mode == render::stars::StarMode::Natural {
@@ -1579,6 +1600,9 @@ fn settings(ui: &mut Ui, a: &mut UiState, p: &Pal) {
                 }
                 slider(ui, p, "Green removal", &mut r.finish.green, 0.0..=1.0, base.finish.green, &base_label, true, "Reduces green where it exceeds the mean of red and blue, like SCNR.");
                 slider(ui, p, "Saturation", &mut r.finish.saturation, 0.0..=2.5, base.finish.saturation, &base_label, true, "Colour saturation. 100% leaves it unchanged.");
+                slider(ui, p, "Nebula detail", &mut r.finish.detail, 0.0..=1.0, base.finish.detail, &base_label, true, "Brings out the nebula's structure: bright filaments and dark lanes gain contrast against their surroundings. Works on the starless image, so stars and fine noise aren't sharpened (stars stretched separately only).");
+                slider(ui, p, "Colour noise", &mut r.finish.chroma, 0.0..=1.0, base.finish.chroma, &base_label, true, "Smooths colour speckle in the faint background: faint parts take the colour of their surroundings, bright nebula keeps its own (stars stretched separately only).");
+                slider(ui, p, "Neutral background", &mut r.finish.neutral, 0.0..=1.0, base.finish.neutral, &base_label, true, "Takes the colour tint out of the faint sky, region by region, fading out towards the nebula. Narrowband palettes boost the weak lines, which tints the faint sky (stars stretched separately, narrowband only).");
             }
         }
     }

@@ -120,6 +120,54 @@ pub fn targets(out: &Path) -> Vec<Target> {
         .collect()
 }
 
+/// Masters stacked by another program (PixInsight WBPP's `masterLight_*`),
+/// read in place: `dir` itself or its `master` subfolder. One target named
+/// `object`; the channel from FILTER (else the file name's `FILTER-X`), the
+/// noise from NOISE00 (ImageIntegration's estimate, image units). Cropped
+/// copies (`_autocrop`), drizzled masters and rejection maps are skipped:
+/// every master kept shares the registration reference's geometry.
+pub fn targets_from_masters(dir: &Path, object: &str) -> Vec<Target> {
+    let sub = dir.join("master");
+    let dir = if sub.is_dir() { sub } else { dir.to_path_buf() };
+    let mut masters: Vec<Master> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let mut files: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_file()).collect();
+    files.sort();
+    for p in files {
+        let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if !name.starts_with("masterlight") || ["autocrop", "drizzle", "rejection", "slope", "weight"].iter().any(|s| name.contains(s)) {
+            continue;
+        }
+        let header = match crate::meta::format_of(&p) {
+            Some(crate::meta::FileFormat::Xisf) => crate::xisf::read_layout(&p).map(|l| l.header),
+            Some(crate::meta::FileFormat::Fits) => crate::fits::read_layout(&p).map(|l| l.header),
+            _ => continue,
+        };
+        let Ok(h) = header else { continue };
+        let filter = h.str("FILTER").filter(|f| !f.trim().is_empty()).or_else(|| {
+            let i = name.find("filter-")? + 7;
+            Some(name[i..].split(['_', '.']).next()?.to_uppercase())
+        });
+        let Some(filter) = filter else { continue };
+        let noise = h.f64("NOISE00").filter(|v| v.is_finite() && *v > 0.0 && *v < 0.1).unwrap_or(0.0);
+        masters.push(Master {
+            channel: palette::canonical(&filter),
+            filter,
+            path: p.clone(),
+            frames: h.i64("NCOMBINE").unwrap_or(0).max(0) as usize,
+            exposure: h.f64("EXPTIME").unwrap_or(0.0),
+            starless: None,
+            noise,
+        });
+    }
+    if masters.is_empty() {
+        return Vec::new();
+    }
+    masters.sort_by_key(|m| ORDER.iter().position(|c| *c == m.channel).unwrap_or(99));
+    masters.dedup_by(|a, b| a.channel == b.channel);
+    vec![Target { object: object.to_string(), masters }]
+}
+
 /// Block mean down to `max` on the longer side; blocks more than half
 /// outside the frame (zero) stay zero, like registration borders.
 pub fn proxy(img: &Image, max: usize) -> Image {
@@ -169,6 +217,8 @@ pub struct Prepared {
     pub stars: stars::StarSettings,
     pub n_stars: usize,
     pub star_cover: f64,
+    /// Edges covered by few frames (full-resolution blocks), for the auto crop.
+    pub thin: Option<Thin>,
     /// The 1:1 crop: x, y, width, height.
     pub crop: (usize, usize, usize, usize),
     /// Each star's light and confidence, and that painted for the proxy,
@@ -185,10 +235,15 @@ impl Prepared {
     }
 }
 
-/// Can this target have natural star colours (narrowband with OIII and
-/// Ha or SII)?
+/// Can this target's stars be handled on their own (narrowband with OIII
+/// and Ha or SII, broadband with R, G and B: stars from their own light;
+/// one channel: grey stars, stretched separately)?
 pub fn stars_possible(names: &[String]) -> bool {
-    palette::kind_of(names) == Kind::Narrowband && names.iter().any(|c| c == "O") && names.iter().any(|c| c == "H" || c == "S")
+    match palette::kind_of(names) {
+        Kind::Narrowband => names.iter().any(|c| c == "O") && names.iter().any(|c| c == "H" || c == "S"),
+        Kind::Broadband => true,
+        Kind::Mono => names.len() == 1,
+    }
 }
 
 /// The target as a recipe wants it: masters sharpened and denoised
@@ -218,6 +273,13 @@ pub fn prepare(t: &Target, g: &GradientSettings, st: &stars::StarSettings, keep_
     let mut channels = Vec::new();
     let mut size = None;
     let mut fulls = Vec::new();
+    // Following the sky closely is for broadband (galaxies, clusters, star
+    // fields; narrowband frames are mostly nebula), sampled on the star
+    // remover's starless masters when there are some (in a star field a
+    // box's median follows how many faint stars it holds) and on a finer
+    // grid.
+    let names0: Vec<String> = t.masters.iter().map(|m| m.channel.clone()).collect();
+    let follow = g.enabled && g.follow_sky && palette::kind_of(&names0) == Kind::Broadband && st.engine == stars::StarEngine::Network && t.masters.iter().all(|m| m.starless.is_some());
     for m in &t.masters {
         if cancel.load(Ordering::Relaxed) {
             anyhow::bail!("cancelled");
@@ -227,7 +289,12 @@ pub fn prepare(t: &Target, g: &GradientSettings, st: &stars::StarSettings, keep_
             None => size = Some((img.width, img.height)),
             Some(s) => anyhow::ensure!(s == (img.width, img.height), "{} is {}×{}, the other masters {}×{}: they must be registered to one reference", m.path.display(), img.width, img.height, s.0, s.1),
         }
-        let smp = g.enabled.then(|| gradient::samples(&img, g.samples));
+        let smp = if follow {
+            let sl = m.starless.as_ref().and_then(|p| crate::read_image(p).ok()).filter(|s| (s.width, s.height) == (img.width, img.height));
+            Some(gradient::samples(sl.as_ref().unwrap_or(&img), 2 * g.samples))
+        } else {
+            g.enabled.then(|| gradient::samples(&img, g.samples))
+        };
         fulls.push((m, img, smp));
     }
     lap("read and sampled");
@@ -240,10 +307,11 @@ pub fn prepare(t: &Target, g: &GradientSettings, st: &stars::StarSettings, keep_
         d.get(d.len().saturating_sub(1) / 2).copied().unwrap_or(1)
     };
     let (width, height) = size.unwrap_or((0, 0));
+    let gfit = &GradientSettings { follow_sky: follow, ..g.clone() };
     let mut corrected = Vec::new();
     for (m, mut img, smp) in fulls {
         let raw_proxy = proxy(&img, PROXY_MAX);
-        let fit = smp.and_then(|s| gradient::fit_samples(&s, g, degree));
+        let fit = smp.and_then(|s| gradient::fit_samples(&s, gfit, degree));
         if let Some((md, _)) = &fit {
             md.apply(&mut img);
         }
@@ -311,16 +379,29 @@ pub fn prepare(t: &Target, g: &GradientSettings, st: &stars::StarSettings, keep_
                         }
                         s
                     });
-                let sl = mask.as_ref().map(|mk| net_sl.unwrap_or_else(|| stars::starless(&img, mk, noise_full, k as u64 + 1)));
+                let sl = mask.as_ref().map(|mk| {
+                    let mut s = net_sl.unwrap_or_else(|| stars::starless(&img, mk, noise_full, k as u64 + 1));
+                    stars::remove_glows(&mut s, &img, &discs, noise_full);
+                    s
+                });
                 let sl_proxy = sl.as_ref().map(|s| proxy(s, PROXY_MAX));
                 let stats_starless = sl.as_ref().zip(sl_proxy.as_ref()).map(|(s, sp)| Stats { sky_noise: m.noise, ..Stats::measure(&s.data, &sp.data) });
                 let crop = cut(&img);
                 let crop_starless = sl.as_ref().map(&cut);
-                (m, img, raw_proxy, model, report, px, stats, noise_full, noise_proxy, sl, sl_proxy, stats_starless, crop, crop_starless)
+                let thin = thin_edges(&img);
+                (m, img, raw_proxy, model, report, px, stats, noise_full, noise_proxy, sl, sl_proxy, stats_starless, crop, crop_starless, thin)
             })
             .collect()
     };
-    for (m, img, raw_proxy, model, report, px, stats, noise_full, noise_proxy, sl, sl_proxy, stats_starless, crop, crop_starless) in per_channel {
+    let mut thin: Option<Thin> = None;
+    for (m, img, raw_proxy, model, report, px, stats, noise_full, noise_proxy, sl, sl_proxy, stats_starless, crop, crop_starless, th) in per_channel {
+        thin = match (thin, th) {
+            (Some(mut a), Some(b)) if (a.w, a.h) == (b.w, b.h) => {
+                a.blocks.iter_mut().zip(&b.blocks).for_each(|(x, y)| *x |= *y);
+                Some(a)
+            }
+            (a, b) => a.or(b),
+        };
         // Star light is measured on full resolution, for every channel.
         let (full, sl) = if mask.is_some() {
             fulls_kept.push(img);
@@ -380,7 +461,7 @@ pub fn prepare(t: &Target, g: &GradientSettings, st: &stars::StarSettings, keep_
     } else {
         vec![1.0; channels.len()]
     };
-    Ok(Prepared { object: t.object.clone(), kind, channels, width, height, star_gain, gradient: g.clone(), stars: st.clone(), n_stars, star_cover, crop: crop_rect, star_info, paint_proxy, paint_crop, paint_full })
+    Ok(Prepared { object: t.object.clone(), kind, channels, width, height, star_gain, gradient: g.clone(), stars: st.clone(), n_stars, star_cover, thin, crop: crop_rect, star_info, paint_proxy, paint_crop, paint_full })
 }
 
 /// An RGB render.
@@ -454,7 +535,7 @@ pub fn coefficients_starless(p: &Prepared, r: &Recipe) -> Option<palette::Coef> 
 
 /// The star layer below this many of its own noise sigmas is left out, so
 /// the starless image's small residuals don't speckle the stars' stretch.
-pub const STAR_FLOOR_SIGMAS: f32 = 2.0;
+pub const STAR_FLOOR_SIGMAS: f32 = stars::STAR_FLOOR_SIGMAS as f32;
 
 /// What the separate stretch needs for one render.
 pub struct Split {
@@ -462,6 +543,300 @@ pub struct Split {
     pub curve: stars::Curve,
     /// Per channel: the star layer's floor at this render's resolution.
     pub floor: Vec<f32>,
+    /// Nebula detail for this render, when asked for.
+    pub detail: Option<Detail>,
+    /// Colour noise reduction for this render, when asked for.
+    pub chroma: Option<Chroma>,
+    /// Neutral background, when asked for.
+    pub neutral: Option<Neutral>,
+}
+
+/// Nebula detail: a band-pass of the stretched starless brightness, made
+/// once from the proxy (fine noise and the picture's overall shape left
+/// out) and sampled at each rendered pixel's place in the full frame, so
+/// the preview, the 1:1 crop and the full render agree.
+pub struct Detail {
+    map: Vec<f32>,
+    mw: usize,
+    mh: usize,
+    /// Rendered pixel to map pixel: `m = (o + x·s) / f`.
+    sx: f32,
+    sy: f32,
+    ox: f32,
+    oy: f32,
+    f: f32,
+    amount: f32,
+}
+
+impl Detail {
+    #[inline]
+    fn at(&self, x: usize, y: usize) -> f32 {
+        let mx = ((self.ox + (x as f32 + 0.5) * self.sx) / self.f - 0.5).clamp(0.0, (self.mw - 1) as f32);
+        let my = ((self.oy + (y as f32 + 0.5) * self.sy) / self.f - 0.5).clamp(0.0, (self.mh - 1) as f32);
+        let (x0, y0) = (mx as usize, my as usize);
+        let (x1, y1) = ((x0 + 1).min(self.mw - 1), (y0 + 1).min(self.mh - 1));
+        let (fx, fy) = (mx - x0 as f32, my - y0 as f32);
+        let m = &self.map;
+        let top = m[y0 * self.mw + x0] * (1.0 - fx) + m[y0 * self.mw + x1] * fx;
+        let bot = m[y1 * self.mw + x0] * (1.0 - fx) + m[y1 * self.mw + x1] * fx;
+        top * (1.0 - fy) + bot * fy
+    }
+
+    /// Lift or lower one starless pixel's brightness by its local detail,
+    /// keeping its colour.
+    #[inline]
+    fn apply(&self, x: usize, y: usize, rgb: [f32; 3]) -> [f32; 3] {
+        let l = (rgb[0] + rgb[1] + rgb[2]) / 3.0;
+        if l <= 1.0e-4 {
+            return rgb;
+        }
+        let k = ((l + self.amount * self.at(x, y)) / l).clamp(0.0, 3.0);
+        rgb.map(|v| (v * k).clamp(0.0, 1.0))
+    }
+}
+
+/// Where a render's pixels sit in the full frame: `X = ox + x·sx`.
+#[derive(Clone, Copy)]
+struct Frame {
+    sx: f32,
+    sy: f32,
+    ox: f32,
+    oy: f32,
+}
+
+impl Frame {
+    /// A render of the whole frame at `w` by `h`.
+    fn whole(p: &Prepared, w: usize, h: usize) -> Frame {
+        Frame { sx: p.width as f32 / w.max(1) as f32, sy: p.height as f32 / h.max(1) as f32, ox: 0.0, oy: 0.0 }
+    }
+}
+
+/// Detail band: fine and coarse scales, as fractions of the frame width.
+const DETAIL_FINE: f32 = 0.0025;
+const DETAIL_COARSE: f32 = 0.02;
+
+/// Box blur of radius `r` along one line, edges extended.
+fn box_line(src: &[f32], r: usize, out: &mut [f32]) {
+    let n = src.len() as isize;
+    let at = |i: isize| src[i.clamp(0, n - 1) as usize];
+    let win = (2 * r + 1) as f32;
+    let r = r as isize;
+    let mut s: f32 = (-r..=r).map(at).sum();
+    for i in 0..n {
+        out[i as usize] = s / win;
+        s += at(i + r + 1) - at(i - r);
+    }
+}
+
+/// A Gaussian of `sigma` pixels from three box blurs, rows then columns.
+fn gauss3(a: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
+    use rayon::prelude::*;
+    // Three boxes of width d have variance 3·(d² − 1)/12 = σ².
+    let r = (((4.0 * sigma * sigma + 1.0).sqrt() - 1.0) / 2.0).round().max(0.0) as usize;
+    let mut out = a.to_vec();
+    if r == 0 {
+        return out;
+    }
+    out.par_chunks_mut(w).for_each(|row| {
+        let mut tmp = row.to_vec();
+        for _ in 0..3 {
+            box_line(&tmp.clone(), r, &mut tmp);
+        }
+        row.copy_from_slice(&tmp);
+    });
+    let cols: Vec<Vec<f32>> = (0..w)
+        .into_par_iter()
+        .map(|x| {
+            let mut c: Vec<f32> = (0..h).map(|y| out[y * w + x]).collect();
+            for _ in 0..3 {
+                box_line(&c.clone(), r, &mut c);
+            }
+            c
+        })
+        .collect();
+    for (x, c) in cols.iter().enumerate() {
+        for y in 0..h {
+            out[y * w + x] = c[y];
+        }
+    }
+    out
+}
+
+/// Colour noise reduction: the stretched starless image's colour smoothed
+/// on the proxy (blurred R, G, B over blurred brightness), sampled at each
+/// rendered pixel's place like [`Detail`]. Faint pixels take it; bright
+/// nebula keeps its own colour.
+pub struct Chroma {
+    /// Smoothed R, G and B as fractions of the brightness (mean 1).
+    maps: [Vec<f32>; 3],
+    mw: usize,
+    mh: usize,
+    sx: f32,
+    sy: f32,
+    ox: f32,
+    oy: f32,
+    f: f32,
+    amount: f32,
+}
+
+/// Colour smoothing scale, a fraction of the proxy's width.
+const CHROMA_SIGMA: f32 = 0.004;
+
+impl Chroma {
+    #[inline]
+    fn apply(&self, x: usize, y: usize, rgb: [f32; 3]) -> [f32; 3] {
+        let l = (rgb[0] + rgb[1] + rgb[2]) / 3.0;
+        if l <= 1.0e-4 {
+            return rgb;
+        }
+        // Full strength up to a quarter brightness, none above 0.6.
+        let t = ((l - 0.25) / 0.35).clamp(0.0, 1.0);
+        let k = self.amount * (1.0 - t * t * (3.0 - 2.0 * t));
+        if k <= 0.0 {
+            return rgb;
+        }
+        let mx = ((self.ox + (x as f32 + 0.5) * self.sx) / self.f - 0.5).clamp(0.0, (self.mw - 1) as f32);
+        let my = ((self.oy + (y as f32 + 0.5) * self.sy) / self.f - 0.5).clamp(0.0, (self.mh - 1) as f32);
+        let (x0, y0) = (mx as usize, my as usize);
+        let (x1, y1) = ((x0 + 1).min(self.mw - 1), (y0 + 1).min(self.mh - 1));
+        let (fx, fy) = (mx - x0 as f32, my - y0 as f32);
+        std::array::from_fn(|c| {
+            let m = &self.maps[c];
+            let top = m[y0 * self.mw + x0] * (1.0 - fx) + m[y0 * self.mw + x1] * fx;
+            let bot = m[y1 * self.mw + x0] * (1.0 - fx) + m[y1 * self.mw + x1] * fx;
+            let smooth = l * (top * (1.0 - fy) + bot * fy);
+            (rgb[c] * (1.0 - k) + smooth * k).clamp(0.0, 1.0)
+        })
+    }
+}
+
+/// Neutral background: the faint sky's colour cast, measured region by
+/// region (a palette's boosted weak lines tint the faint sky, more towards
+/// the edges where the flats or the gradient fit leave a little), taken out
+/// in full up to twice the dark pixels' brightness and fading to nothing by
+/// four times (at most 0.6), so nebula keeps its colour.
+pub struct Neutral {
+    /// Per proxy pixel: the dark sky's colour less its mean (sums to zero,
+    /// so brightness doesn't change), smoothed over a large scale.
+    cast: [Vec<f32>; 3],
+    mw: usize,
+    mh: usize,
+    sx: f32,
+    sy: f32,
+    ox: f32,
+    oy: f32,
+    f: f32,
+    level: f32,
+    amount: f32,
+}
+
+/// The darker share of the starless proxy taken as sky, and the scale its
+/// colour is smoothed over (a fraction of the width).
+const NEUTRAL_DARK: f64 = 0.4;
+const NEUTRAL_SIGMA: f32 = 0.06;
+
+impl Neutral {
+    #[inline]
+    fn apply(&self, x: usize, y: usize, rgb: [f32; 3]) -> [f32; 3] {
+        let l = (rgb[0] + rgb[1] + rgb[2]) / 3.0;
+        let (a, b) = (2.0 * self.level, (4.0 * self.level).clamp(2.0 * self.level + 0.05, 0.6));
+        let t = ((l - a) / (b - a)).clamp(0.0, 1.0);
+        let k = self.amount * (1.0 - t * t * (3.0 - 2.0 * t)) * (l / self.level.max(1.0e-4)).min(1.0);
+        if k <= 0.0 {
+            return rgb;
+        }
+        let mx = ((self.ox + (x as f32 + 0.5) * self.sx) / self.f - 0.5).clamp(0.0, (self.mw - 1) as f32);
+        let my = ((self.oy + (y as f32 + 0.5) * self.sy) / self.f - 0.5).clamp(0.0, (self.mh - 1) as f32);
+        let (x0, y0) = (mx as usize, my as usize);
+        let (x1, y1) = ((x0 + 1).min(self.mw - 1), (y0 + 1).min(self.mh - 1));
+        let (fx, fy) = (mx - x0 as f32, my - y0 as f32);
+        std::array::from_fn(|c| {
+            let m = &self.cast[c];
+            let top = m[y0 * self.mw + x0] * (1.0 - fx) + m[y0 * self.mw + x1] * fx;
+            let bot = m[y1 * self.mw + x0] * (1.0 - fx) + m[y1 * self.mw + x1] * fx;
+            (rgb[c] - k * (top * (1.0 - fy) + bot * fy)).clamp(0.0, 1.0)
+        })
+    }
+}
+
+fn neutral_of(p: &Prepared, r: &Recipe, coef: &palette::Coef, frame: Frame) -> Option<Neutral> {
+    // Narrowband only: a broadband sky's leftover tint follows its
+    // brightness gradient (NGC 2997: the corners turned teal).
+    if r.finish.neutral <= 0.0 || p.kind != Kind::Narrowband {
+        return None;
+    }
+    let sp: Vec<&[f32]> = p.channels.iter().map(|c| c.starless_proxy.as_ref().map(|i| i.data.as_slice())).collect::<Option<_>>()?;
+    let first = p.channels[0].starless_proxy.as_ref()?;
+    let (mw, mh) = (first.width, first.height);
+    let n = mw * mh;
+    let (mut rr, mut gg, mut bb) = (vec![0f32; n], vec![0f32; n], vec![0f32; n]);
+    palette::process(&sp, coef, &mut rr, &mut gg, &mut bb);
+    let lum: Vec<f32> = (0..n).map(|i| (rr[i] + gg[i] + bb[i]) / 3.0).collect();
+    // Pixels with data (crop edges and empty corners are zero).
+    let mut ls: Vec<f32> = lum.iter().copied().filter(|l| *l > 0.005).collect();
+    if ls.len() < 100 {
+        return None;
+    }
+    let cut = ((ls.len() as f64 * NEUTRAL_DARK) as usize).min(ls.len() - 1);
+    let (_, thr, _) = ls.select_nth_unstable_by(cut, |a, b| a.total_cmp(b));
+    let thr = *thr;
+    let dark: Vec<f32> = lum.iter().map(|l| if *l > 0.005 && *l <= thr { 1.0 } else { 0.0 }).collect();
+    let level = {
+        let (s, c) = lum.iter().zip(&dark).fold((0.0f64, 0.0f64), |(s, c), (l, d)| (s + (*l * *d) as f64, c + *d as f64));
+        (s / c.max(1.0)) as f32
+    };
+    let sigma = NEUTRAL_SIGMA * mw as f32;
+    let wsum = gauss3(&dark, mw, mh, sigma);
+    let mean_of = |c: &[f32]| -> Vec<f32> {
+        let m: Vec<f32> = c.iter().zip(&dark).map(|(v, d)| v * d).collect();
+        gauss3(&m, mw, mh, sigma).iter().zip(&wsum).map(|(v, w)| if *w > 1.0e-3 { v / w } else { 0.0 }).collect()
+    };
+    let (mr, mg, mb) = (mean_of(&rr), mean_of(&gg), mean_of(&bb));
+    let mut cast = [vec![0f32; n], vec![0f32; n], vec![0f32; n]];
+    for i in 0..n {
+        let m = (mr[i] + mg[i] + mb[i]) / 3.0;
+        cast[0][i] = mr[i] - m;
+        cast[1][i] = mg[i] - m;
+        cast[2][i] = mb[i] - m;
+    }
+    Some(Neutral { cast, mw, mh, sx: frame.sx, sy: frame.sy, ox: frame.ox, oy: frame.oy, f: p.width as f32 / mw as f32, level, amount: r.finish.neutral.clamp(0.0, 1.0) as f32 })
+}
+
+/// The colour map for a recipe (None when off, or without a starless proxy).
+fn chroma_of(p: &Prepared, r: &Recipe, coef: &palette::Coef, frame: Frame) -> Option<Chroma> {
+    if r.finish.chroma <= 0.0 {
+        return None;
+    }
+    let sp: Vec<&[f32]> = p.channels.iter().map(|c| c.starless_proxy.as_ref().map(|i| i.data.as_slice())).collect::<Option<_>>()?;
+    let first = p.channels[0].starless_proxy.as_ref()?;
+    let (mw, mh) = (first.width, first.height);
+    let n = mw * mh;
+    let (mut rr, mut gg, mut bb) = (vec![0f32; n], vec![0f32; n], vec![0f32; n]);
+    palette::process(&sp, coef, &mut rr, &mut gg, &mut bb);
+    let l: Vec<f32> = (0..n).map(|i| (rr[i] + gg[i] + bb[i]) / 3.0).collect();
+    let sigma = (CHROMA_SIGMA * mw as f32).max(1.5);
+    let ls = gauss3(&l, mw, mh, sigma);
+    let ratio = |c: &[f32]| -> Vec<f32> { gauss3(c, mw, mh, sigma).iter().zip(&ls).map(|(v, l)| if *l > 1.0e-5 { v / l } else { 1.0 }).collect() };
+    Some(Chroma { maps: [ratio(&rr), ratio(&gg), ratio(&bb)], mw, mh, sx: frame.sx, sy: frame.sy, ox: frame.ox, oy: frame.oy, f: p.width as f32 / mw as f32, amount: r.finish.chroma.clamp(0.0, 1.0) as f32 })
+}
+
+/// The detail map for a recipe (None when off, or without a starless
+/// proxy).
+fn detail_of(p: &Prepared, r: &Recipe, coef: &palette::Coef, frame: Frame) -> Option<Detail> {
+    if r.finish.detail <= 0.0 {
+        return None;
+    }
+    let sp: Vec<&[f32]> = p.channels.iter().map(|c| c.starless_proxy.as_ref().map(|i| i.data.as_slice())).collect::<Option<_>>()?;
+    let first = p.channels[0].starless_proxy.as_ref()?;
+    let (mw, mh) = (first.width, first.height);
+    let n = mw * mh;
+    let (mut rr, mut gg, mut bb) = (vec![0f32; n], vec![0f32; n], vec![0f32; n]);
+    palette::process(&sp, coef, &mut rr, &mut gg, &mut bb);
+    let l: Vec<f32> = (0..n).map(|i| (rr[i] + gg[i] + bb[i]) / 3.0).collect();
+    let fine = gauss3(&l, mw, mh, (DETAIL_FINE * mw as f32).max(0.7));
+    let coarse = gauss3(&l, mw, mh, DETAIL_COARSE * mw as f32);
+    let map: Vec<f32> = fine.iter().zip(&coarse).map(|(a, b)| a - b).collect();
+    Some(Detail { map, mw, mh, sx: frame.sx, sy: frame.sy, ox: frame.ox, oy: frame.oy, f: p.width as f32 / mw as f32, amount: 2.0 * r.finish.detail.clamp(0.0, 1.0) as f32 })
 }
 
 /// Noise σ of `full − bare` (1.4826 × MAD), registration borders left out:
@@ -486,15 +861,35 @@ fn layer_sigma(full: &[f32], bare: &[f32]) -> f32 {
 /// The separate stretch's constants, with the floor measured on `planes`
 /// and `bare` (the render's own resolution, or a 1:1 crop standing in for
 /// full size).
-fn split_of(p: &Prepared, r: &Recipe, planes: &[&[f32]], bare: &[&[f32]]) -> Option<Split> {
+fn split_of(p: &Prepared, r: &Recipe, planes: &[&[f32]], bare: &[&[f32]], frame: Frame) -> Option<Split> {
     let coef = coefficients_starless(p, r)?;
+    let detail = detail_of(p, r, &coef, frame);
+    let chroma = chroma_of(p, r, &coef, frame);
+    let neutral = neutral_of(p, r, &coef, frame);
     let names = p.names();
-    let h = names.iter().position(|c| c == "H").or(names.iter().position(|c| c == "S"))?;
-    let ch = &p.channels[h];
+    // The star layer's stretch follows the reference channel's noise (H,
+    // else S; G, else L for broadband).
+    let ch = &p.channels[palette::reference(&names, p.kind)];
     let noise = if ch.stats.sky_noise > 0.0 { ch.stats.sky_noise } else { ch.noise_full as f64 };
     let curve = stars::Curve::new(noise, r.stretch.clip, r.stretch.background, r.stars.size, r.stars.brightness);
-    let floor = planes.iter().zip(bare).map(|(f, b)| STAR_FLOOR_SIGMAS * layer_sigma(f, b)).collect();
-    Some(Split { coef, curve, floor })
+    // The floor: the star layer's own noise (none where the starless image
+    // keeps the original's noise, as the star remover's and the classic
+    // fill's do away from stars) times the cut, up to the default 2σ; a
+    // higher cut adds the channel's noise at this resolution for each σ
+    // beyond, which thins out faint stars and halos.
+    let cut = r.stars.faint_cut.clamp(0.0, 50.0) as f32;
+    let at_proxy = planes.first().is_some_and(|pl| pl.len() == p.channels[0].proxy.data.len());
+    let floor = planes
+        .iter()
+        .zip(bare)
+        .zip(&p.channels)
+        .map(|((f, b), c)| {
+            let own = cut.min(STAR_FLOOR_SIGMAS) * layer_sigma(f, b);
+            let noise = if at_proxy { c.noise_proxy } else { c.noise_full };
+            own + (cut - STAR_FLOOR_SIGMAS).max(0.0) * noise
+        })
+        .collect();
+    Some(Split { coef, curve, floor, detail, chroma, neutral })
 }
 
 /// Star colour constants.
@@ -504,11 +899,19 @@ fn colour(p: &Prepared, r: &Recipe) -> Option<stars::Colour> {
     }
     let names = p.names();
     let at = |n: &str| names.iter().position(|c| c == n);
+    if p.kind == Kind::Mono {
+        return (names.len() == 1).then(|| stars::Colour { h: 0, o: 0, s: None, gain_o: 1.0, gain_s: 1.0, ha_to_green: 0.0, saturation: 0.0, rgb: Some(([0, 0, 0], [1.0; 3])) });
+    }
+    if p.kind == Kind::Broadband {
+        let (ri, gi, bi) = (at("R")?, at("G")?, at("B")?);
+        let gain = |i: usize| (p.star_gain.get(i).copied().unwrap_or(1.0) / p.star_gain.get(gi).copied().unwrap_or(1.0)) as f32;
+        return Some(stars::Colour { h: gi, o: bi, s: None, gain_o: 1.0, gain_s: 1.0, ha_to_green: 0.0, saturation: r.stars.saturation as f32, rgb: Some(([ri, gi, bi], [gain(ri), 1.0, gain(bi)])) });
+    }
     let h = at("H").or(at("S"))?;
     let o = at("O")?;
     let s = at("S").filter(|si| *si != h);
     let gain = |i: usize| (p.star_gain.get(i).copied().unwrap_or(1.0) / p.star_gain.get(h).copied().unwrap_or(1.0)) as f32;
-    Some(stars::Colour { h, o, s, gain_o: gain(o), gain_s: s.map(gain).unwrap_or(1.0), ha_to_green: r.stars.ha_to_green as f32, saturation: r.stars.saturation as f32 })
+    Some(stars::Colour { h, o, s, gain_o: gain(o), gain_s: s.map(gain).unwrap_or(1.0), ha_to_green: r.stars.ha_to_green as f32, saturation: r.stars.saturation as f32, rgb: None })
 }
 
 /// Render planes; with `bare` (the same planes without stars) and a
@@ -534,6 +937,30 @@ fn render_planes(planes: &[&[f32]], bare: Option<&[&[f32]]>, w: usize, h: usize,
                 let (mut fr, mut fg, mut fb) = (vec![0f32; len], vec![0f32; len], vec![0f32; len]);
                 palette::process(&ch, coef, &mut fr, &mut fg, &mut fb);
                 palette::process(&bc, &sp.coef, rr, gg, bb);
+                if let Some(nt) = &sp.neutral {
+                    for i in 0..len {
+                        let o = nt.apply((s + i) % w, (s + i) / w, [rr[i], gg[i], bb[i]]);
+                        rr[i] = o[0];
+                        gg[i] = o[1];
+                        bb[i] = o[2];
+                    }
+                }
+                if let Some(cm) = &sp.chroma {
+                    for i in 0..len {
+                        let o = cm.apply((s + i) % w, (s + i) / w, [rr[i], gg[i], bb[i]]);
+                        rr[i] = o[0];
+                        gg[i] = o[1];
+                        bb[i] = o[2];
+                    }
+                }
+                if let Some(d) = &sp.detail {
+                    for i in 0..len {
+                        let o = d.apply((s + i) % w, (s + i) / w, [rr[i], gg[i], bb[i]]);
+                        rr[i] = o[0];
+                        gg[i] = o[1];
+                        bb[i] = o[2];
+                    }
+                }
                 for i in 0..len {
                     let light = |k: usize| {
                         let v = ch[k][i];
@@ -573,7 +1000,7 @@ pub fn render_proxy(p: &Prepared, r: &Recipe) -> Rgb {
     let planes: Vec<&[f32]> = p.channels.iter().map(|c| c.proxy.data.as_slice()).collect();
     let col = colour(p, r);
     let bare: Option<Vec<&[f32]>> = col.as_ref().and_then(|_| p.channels.iter().map(|c| c.starless_proxy.as_ref().map(|i| i.data.as_slice())).collect());
-    let split = bare.as_ref().and_then(|b| split_of(p, r, &planes, b));
+    let split = bare.as_ref().and_then(|b| split_of(p, r, &planes, b, Frame::whole(p, w, h)));
     render_planes(&planes, bare.as_deref(), w, h, &coef, col.as_ref().zip(p.paint_proxy.as_ref()), split.as_ref())
 }
 
@@ -584,7 +1011,8 @@ pub fn render_crop(p: &Prepared, r: &Recipe) -> Rgb {
     let planes: Vec<&[f32]> = p.channels.iter().map(|c| c.crop.data.as_slice()).collect();
     let col = colour(p, r);
     let bare: Option<Vec<&[f32]>> = col.as_ref().and_then(|_| p.channels.iter().map(|c| c.crop_starless.as_ref().map(|i| i.data.as_slice())).collect());
-    let split = bare.as_ref().and_then(|b| split_of(p, r, &planes, b));
+    let frame = Frame { sx: 1.0, sy: 1.0, ox: p.crop.0 as f32, oy: p.crop.1 as f32 };
+    let split = bare.as_ref().and_then(|b| split_of(p, r, &planes, b, frame));
     render_planes(&planes, bare.as_deref(), w, h, &coef, col.as_ref().zip(p.paint_crop.as_ref()), split.as_ref())
 }
 
@@ -609,7 +1037,7 @@ pub fn render_tile(p: &Prepared, r: &Recipe, max: usize) -> Rgb {
     let bare: Option<Vec<&[f32]>> = bare_imgs.as_ref().map(|v| v.iter().map(|i| i.data.as_slice()).collect());
     let (tw, th) = (small[0].width, small[0].height);
     let pt = col.as_ref().map(|_| stars::paint(&p.star_info, p.channels.len(), tw, th, tw as f32 / p.width.max(1) as f32, 0.0, 0.0));
-    let split = bare.as_ref().and_then(|b| split_of(p, r, &planes, b));
+    let split = bare.as_ref().and_then(|b| split_of(p, r, &planes, b, Frame::whole(p, tw, th)));
     render_planes(&planes, bare.as_deref(), tw, th, &coef, col.as_ref().zip(pt.as_ref()), split.as_ref())
 }
 
@@ -624,7 +1052,7 @@ pub fn render_full(p: &Prepared, r: &Recipe) -> Result<Rgb> {
     // pixels.
     let crop: Vec<&[f32]> = p.channels.iter().map(|c| c.crop.data.as_slice()).collect();
     let crop_bare: Option<Vec<&[f32]>> = p.channels.iter().map(|c| c.crop_starless.as_ref().map(|i| i.data.as_slice())).collect();
-    let split = bare.as_ref().and(crop_bare.as_ref()).and_then(|b| split_of(p, r, &crop, b));
+    let split = bare.as_ref().and(crop_bare.as_ref()).and_then(|b| split_of(p, r, &crop, b, Frame::whole(p, p.width, p.height)));
     let rgb = render_planes(&planes, bare.as_deref(), p.width, p.height, &coef, col.as_ref().zip(p.paint_full.as_ref()), split.as_ref());
     Ok(match &r.crop {
         Some(c) if !c.is_whole() => rgb.cropped(c),
@@ -643,7 +1071,17 @@ pub fn auto_crop(p: &Prepared) -> Option<recipe::Crop> {
     if w < 4 || h < 4 {
         return None;
     }
-    let valid: Vec<bool> = (0..w * h).map(|i| p.channels.iter().all(|c| c.raw_proxy.data.get(i).is_some_and(|v| *v > 0.0))).collect();
+    let mut valid: Vec<bool> = (0..w * h).map(|i| p.channels.iter().all(|c| c.raw_proxy.data.get(i).is_some_and(|v| *v > 0.0))).collect();
+    if let Some(t) = &p.thin {
+        for y in 0..h {
+            for x in 0..w {
+                let (bx, by) = ((x * t.w / w).min(t.w - 1), (y * t.h / h).min(t.h - 1));
+                if t.blocks[by * t.w + bx] {
+                    valid[y * w + x] = false;
+                }
+            }
+        }
+    }
     if valid.iter().all(|v| *v) {
         return None;
     }
@@ -657,6 +1095,91 @@ pub fn auto_crop(p: &Prepared) -> Option<recipe::Crop> {
         return None;
     }
     Some(recipe::Crop { left: x0 as f64 / w as f64, top: y0 as f64 / h as f64, right: x1 as f64 / w as f64, bottom: y1 as f64 / h as f64 })
+}
+
+/// Blocks (32 px of the master) whose fine noise is this many times the
+/// picture's typical block count as thinly covered.
+const THIN_NOISE: f32 = 2.5;
+const THIN_BLOCK: usize = 32;
+/// Rows or columns along an edge whose median block is this many times the
+/// typical block's are thinly covered too.
+const THIN_STRIP: f32 = 1.4;
+
+/// Edges covered by few frames, as a grid of [`THIN_BLOCK`] px blocks.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Thin {
+    pub w: usize,
+    pub h: usize,
+    pub blocks: Vec<bool>,
+}
+
+/// Edges covered by few frames (a stack's frames framed differently on
+/// different nights): blocks whose fine noise is [`THIN_NOISE`] × the
+/// typical block's, reached from the picture's edge through such blocks
+/// (bright nebula inside the picture can be as rough, but isn't joined to
+/// the edge). None when there are none.
+fn thin_edges(img: &Image) -> Option<Thin> {
+    use rayon::prelude::*;
+    const B: usize = THIN_BLOCK;
+    let (w, h) = (img.width, img.height);
+    let (bw, bh) = (w / B, h / B);
+    if bw < 4 || bh < 4 {
+        return None;
+    }
+    let d = &img.data;
+    let noise: Vec<f32> = (0..bw * bh)
+        .into_par_iter()
+        .map(|k| {
+            let (bx, by) = (k % bw, k / bw);
+            let mut v: Vec<f32> = Vec::with_capacity(B * B);
+            for y in (by * B).max(1)..((by + 1) * B).min(h - 1) {
+                for x in (bx * B).max(1)..((bx + 1) * B).min(w - 1) {
+                    let i = y * w + x;
+                    if d[i] > 0.0 {
+                        v.push(d[i] - 0.25 * (d[i - 1] + d[i + 1] + d[i - w] + d[i + w]));
+                    }
+                }
+            }
+            if v.len() < 64 {
+                return 0.0;
+            }
+            let m = crate::stats::median_mut(&mut v);
+            v.iter_mut().for_each(|x| *x = (*x - m).abs());
+            crate::stats::median_mut(&mut v)
+        })
+        .collect();
+    let mut sorted: Vec<f32> = noise.iter().copied().filter(|v| *v > 0.0).collect();
+    if sorted.len() < 16 {
+        return None;
+    }
+    let typical = crate::stats::median_mut(&mut sorted);
+    let rough: Vec<bool> = noise.iter().map(|v| *v > THIN_NOISE * typical).collect();
+    // Flood from the edge blocks through rough blocks.
+    let mut thin = vec![false; bw * bh];
+    let mut stack: Vec<usize> = (0..bw * bh).filter(|&k| (k % bw == 0 || k % bw == bw - 1 || k / bw == 0 || k / bw == bh - 1) && rough[k]).collect();
+    while let Some(k) = stack.pop() {
+        if thin[k] {
+            continue;
+        }
+        thin[k] = true;
+        let (bx, by) = (k % bw, k / bw);
+        let near = [(bx > 0).then(|| k - 1), (bx + 1 < bw).then(|| k + 1), (by > 0).then(|| k - bw), (by + 1 < bh).then(|| k + bw)];
+        stack.extend(near.into_iter().flatten().filter(|&j| rough[j] && !thin[j]));
+    }
+    // Whole strips along an edge a little rougher than the rest (half the
+    // frames: √2): rows and columns judged by their median block, so
+    // nebula filling part of one doesn't count.
+    let strip = |vals: Vec<f32>| crate::stats::median(&vals) > THIN_STRIP * typical;
+    let col = |x: usize| strip((0..bh).map(|y| noise[y * bw + x]).collect());
+    let row = |y: usize| strip(noise[y * bw..(y + 1) * bw].to_vec());
+    let mut mark = |k: usize| thin[k] = true;
+    for x in (0..bw / 4).take_while(|&x| col(x)).chain((bw - bw / 4..bw).rev().take_while(|&x| col(x))) {
+        (0..bh).for_each(|y| mark(y * bw + x));
+    }
+    for y in (0..bh / 4).take_while(|&y| row(y)).chain((bh - bh / 4..bh).rev().take_while(|&y| row(y))) {
+        (0..bw).for_each(|x| mark(y * bw + x));
+    }
+    thin.iter().any(|t| *t).then_some(Thin { w: bw, h: bh, blocks: thin })
 }
 
 /// Largest all-true rectangle (x0, y0, x1, y1, ends exclusive): the
@@ -786,6 +1309,17 @@ pub fn write(rgb: &Rgb, dir: &Path, object: &str, recipe: &Recipe, extra: &Heade
     Ok(Written { xisf, fits, png, jpg, preview, recipe: rp, seconds: t0.elapsed().as_secs_f64(), width: rgb.width, height: rgb.height })
 }
 
+/// A small JPEG only (longest side at most `max`, block mean) plus the
+/// recipe: for comparing many renders without writing full-size files.
+pub fn write_small(rgb: &Rgb, dir: &Path, object: &str, recipe: &Recipe, max: usize) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let jpg = dir.join(format!("{}.jpg", base_name(object, recipe)));
+    let small = shrink(rgb, max);
+    write_jpeg(&jpg, &small, small.is_grey(), JPEG_QUALITY)?;
+    recipe.save(&dir.join("recipe.toml"))?;
+    Ok(jpg)
+}
+
 /// Block-mean copy with the longest side at most `max` (whole factors).
 pub fn shrink(rgb: &Rgb, max: usize) -> Rgb {
     let f = rgb.width.max(rgb.height).div_ceil(max.max(1)).max(1);
@@ -867,6 +1401,26 @@ pub fn write_png16(path: &Path, rgb: &Rgb, grey: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_thinly_covered_edges() {
+        let (w, h) = (1024usize, 640usize);
+        let mut rng = 99u64;
+        let mut img = Image::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let n = ((rng >> 33) as f32 / (1u64 << 31) as f32 - 0.5) * 0.01;
+                // The right 10% saw half the frames: √2 the noise.
+                let k = if x >= 922 { 1.5 } else { 1.0 };
+                img.data[y * w + x] = 0.1 + k * n;
+            }
+        }
+        let t = thin_edges(&img).expect("thin strip found");
+        let col = |bx: usize| (0..t.h).all(|by| t.blocks[by * t.w + bx]);
+        assert!(col(t.w - 1) && col(t.w - 2), "right strip");
+        assert!(!col(0) && !col(t.w / 2), "left and middle stay");
+    }
 
     #[test]
     fn renders_and_writes_a_synthetic_target() {

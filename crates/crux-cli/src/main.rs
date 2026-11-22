@@ -280,9 +280,11 @@ enum Cmd {
         #[arg(long)]
         no_gradient: bool,
         /// Narrowband stars: "natural" (a starless mix with naturally
-        /// coloured stars added back) or "keep" (as the palette mixes them).
-        /// Default: the recipe's (natural).
-        #[arg(long, value_parser = ["natural", "keep", "network"])]
+        /// coloured stars added back), "keep" (as the palette mixes them),
+        /// "network" (natural, starless made by crux's star remover) or
+        /// "classic" (natural, starless made by the classic fill).
+        /// Default: the recipe's (natural, star remover).
+        #[arg(long, value_parser = ["natural", "keep", "network", "classic"])]
         stars: Option<String>,
         /// Natural stars: one stretch for the stars and the starless image
         /// (stars recoloured in place) instead of stretching them separately
@@ -317,6 +319,15 @@ enum Cmd {
         /// Ignore the recipe's denoise and sharpen settings.
         #[arg(long)]
         no_enhance: bool,
+        /// DIR holds masters stacked by another program (PixInsight WBPP's
+        /// masterLight files, in DIR or DIR\master): one target named after
+        /// the folder, read in place.
+        #[arg(long)]
+        masters: bool,
+        /// Write only a JPEG with its longest side at most this many pixels
+        /// (and the recipe), not the full-size XISF, PNG and JPEG.
+        #[arg(long)]
+        size: Option<usize>,
     },
     /// Assemble mosaics from a target's integrated panel masters ("LMC
     /// Panel 1", "LMC Panel 2", …): plate-solved, distortion-corrected,
@@ -877,7 +888,7 @@ fn run() -> Result<()> {
             let out = crux_core::process::job::out_dir(dir, &ws);
             mosaic(&out, target.as_deref(), &s, *force, cfg.process.fits)?
         }
-        Cmd::Image { dir, workspace, object, recipe, preset, no_gradient, stars, one_stretch, star_size, star_brightness, save_recipe, denoise, sharpen, sharpen_amount, engine, no_enhance } => image(&cli, dir, workspace.as_deref(), object.as_deref(), recipe.as_deref(), preset.as_deref(), *no_gradient, &StarArgs { mode: stars.clone(), one_stretch: *one_stretch, size: *star_size, brightness: *star_brightness }, save_recipe.as_deref(), &EnhanceArgs { denoise: *denoise, sharpen: sharpen.clone(), sharpen_amount: *sharpen_amount, engine: engine.clone(), off: *no_enhance })?,
+        Cmd::Image { dir, workspace, object, recipe, preset, no_gradient, stars, one_stretch, star_size, star_brightness, save_recipe, denoise, sharpen, sharpen_amount, engine, no_enhance, masters, size } => image(&cli, dir, workspace.as_deref(), object.as_deref(), recipe.as_deref(), preset.as_deref(), *no_gradient, &StarArgs { mode: stars.clone(), one_stretch: *one_stretch, size: *star_size, brightness: *star_brightness }, save_recipe.as_deref(), &EnhanceArgs { denoise: *denoise, sharpen: sharpen.clone(), sharpen_amount: *sharpen_amount, engine: engine.clone(), off: *no_enhance }, *masters, *size)?,
         Cmd::Recipe { what } => match what.as_ref().unwrap_or(&RecipeCmd::List) {
             RecipeCmd::List => {
                 let l = crux_core::render::recipe::list();
@@ -1788,19 +1799,28 @@ struct StarArgs {
     brightness: Option<f64>,
 }
 
-fn image(cli: &Cli, dir: &Path, workspace: Option<&Path>, object: Option<&str>, recipe: Option<&str>, preset: Option<&str>, no_gradient: bool, stars: &StarArgs, save_recipe: Option<&str>, enhance: &EnhanceArgs) -> Result<()> {
+fn image(cli: &Cli, dir: &Path, workspace: Option<&Path>, object: Option<&str>, recipe: Option<&str>, preset: Option<&str>, no_gradient: bool, stars: &StarArgs, save_recipe: Option<&str>, enhance: &EnhanceArgs, masters: bool, size: Option<usize>) -> Result<()> {
     use crux_core::render::{self, palette, recipe::Recipe};
     let (cfg, _) = Config::load(cli.config.as_deref(), Some(dir))?;
     let ws = workspace.map(Path::to_path_buf).unwrap_or_else(|| cfg.process.workspace.clone());
-    let out = crux_core::process::job::out_dir(dir, &ws);
-    let mut targets: Vec<render::Target> = render::targets(&out).into_iter().filter(|t| object.is_none_or(|o| t.object.to_lowercase().contains(&o.to_lowercase()))).collect();
+    // Another program's masters: the target is named after the data folder
+    // (the parent of a `master` folder), and so is its workspace folder.
+    let named = if masters && dir.file_name().is_some_and(|n| n.eq_ignore_ascii_case("master")) { dir.parent().unwrap_or(dir) } else { dir };
+    let out = crux_core::process::job::out_dir(named, &ws);
+    let found = if masters {
+        let object = named.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "target".into());
+        render::targets_from_masters(dir, &object)
+    } else {
+        render::targets(&out)
+    };
+    let mut targets: Vec<render::Target> = found.into_iter().filter(|t| object.is_none_or(|o| t.object.to_lowercase().contains(&o.to_lowercase()))).collect();
     // An exact name ("LMC", the mosaic) wins over the names containing it.
     if let Some(o) = object {
         if targets.iter().any(|t| t.object.eq_ignore_ascii_case(o)) {
             targets.retain(|t| t.object.eq_ignore_ascii_case(o));
         }
     }
-    anyhow::ensure!(!targets.is_empty(), "no integrated masters in {} (run crux process first)", out.display());
+    anyhow::ensure!(!targets.is_empty(), "{}", if masters { format!("no masterLight files in {}", dir.display()) } else { format!("no integrated masters in {} (run crux process first)", out.display()) });
     let given = recipe.map(crux_core::render::recipe::find).transpose()?;
     let cancel = std::sync::atomic::AtomicBool::new(false);
     for t in &targets {
@@ -1837,6 +1857,10 @@ fn image(cli: &Cli, dir: &Path, workspace: Option<&Path>, object: Option<&str>, 
             Some("network") => {
                 r.stars.mode = crux_core::render::stars::StarMode::Natural;
                 r.stars.engine = crux_core::render::stars::StarEngine::Network;
+            }
+            Some("classic") => {
+                r.stars.mode = crux_core::render::stars::StarMode::Natural;
+                r.stars.engine = crux_core::render::stars::StarEngine::Classic;
             }
             _ => {}
         }
@@ -1909,21 +1933,32 @@ fn image(cli: &Cli, dir: &Path, workspace: Option<&Path>, object: Option<&str>, 
         if render::stars_on(&p, &r) {
             let at = |n: &str| names_p.iter().position(|c| c == n);
             let g = |n: &str| at(n).map(|i| p.star_gain[i] / at("H").map(|h| p.star_gain[h]).unwrap_or(1.0));
-            println!(
-                "  stars: {} found ({:.1}% of the frame), {} (median star white: O ×{:.2}{}; red {:.0}% of green)",
-                p.n_stars,
-                p.star_cover * 100.0,
-                if render::separate_on(&p, &r) {
-                    format!("stretched separately (size {:.0}%, brightness {:.0}%) and screened onto the starless image", r.stars.size * 100.0, r.stars.brightness * 100.0)
-                } else {
-                    "recoloured from their own light".to_string()
-                },
-                g("O").unwrap_or(1.0),
-                g("S").filter(|_| at("H").is_some()).map(|x| format!(", S ×{x:.2}")).unwrap_or_default(),
-                r.stars.ha_to_green * 100.0
-            );
+            let how = if render::separate_on(&p, &r) {
+                format!("stretched separately (size {:.0}%, brightness {:.0}%) and screened onto the starless image", r.stars.size * 100.0, r.stars.brightness * 100.0)
+            } else {
+                "recoloured from their own light".to_string()
+            };
+            let white = if p.kind == palette::Kind::Mono {
+                "grey".to_string()
+            } else if p.kind == palette::Kind::Broadband {
+                let gg = |n: &str| at(n).zip(at("G")).map(|(i, j)| p.star_gain[i] / p.star_gain[j]).unwrap_or(1.0);
+                format!("median star white: R ×{:.2}, B ×{:.2}", gg("R"), gg("B"))
+            } else {
+                format!(
+                    "median star white: O ×{:.2}{}; red {:.0}% of green",
+                    g("O").unwrap_or(1.0),
+                    g("S").filter(|_| at("H").is_some()).map(|x| format!(", S ×{x:.2}")).unwrap_or_default(),
+                    r.stars.ha_to_green * 100.0
+                )
+            };
+            println!("  stars: {} found ({:.1}% of the frame), {how} ({white})", p.n_stars, p.star_cover * 100.0);
         }
         let rgb = render::render_full(&p, &r)?;
+        if let Some(max) = size {
+            let jpg = render::write_small(&rgb, &dir_out, &t.object, &r, max)?;
+            println!("  wrote {} ({:.1} s)", jpg.display(), t0.elapsed().as_secs_f64());
+            continue;
+        }
         let mut extra = crux_core::header::Header::default();
         extra.push("NCHANNEL", &names.len().to_string(), "masters mixed");
         let w = render::write(&rgb, &dir_out, &t.object, &r, &extra, cfg.process.fits)?;

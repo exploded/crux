@@ -38,13 +38,50 @@ pub struct GradientSettings {
     /// more, at the cost of a less complete fit.
     pub tolerance: f32,
     pub correction: Correction,
+    /// In sparse fields (galaxies, clusters, star fields: nearly every box
+    /// is sky), also follow what the polynomial leaves (vignetting a flat
+    /// didn't remove, rings, patches) with a smooth mesh through the sky
+    /// boxes. Nebula-filled frames never get it.
+    pub follow_sky: bool,
 }
 
 impl Default for GradientSettings {
     fn default() -> Self {
-        GradientSettings { enabled: true, degree: 0, samples: 20, tolerance: 1.0, correction: Correction::Subtract }
+        GradientSettings { enabled: true, degree: 0, samples: 20, tolerance: 1.0, correction: Correction::Subtract, follow_sky: false }
     }
 }
+
+/// A smooth correction on top of the polynomial: values on an `nx` × `ny`
+/// grid over normalised coordinates, interpolated bilinearly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Mesh {
+    pub nx: usize,
+    pub ny: usize,
+    pub vals: Vec<f64>,
+}
+
+impl Mesh {
+    fn at(&self, u: f64, v: f64) -> f64 {
+        let gx = ((u + 1.0) / 2.0 * (self.nx - 1) as f64).clamp(0.0, (self.nx - 1) as f64);
+        let gy = ((v + 1.0) / 2.0 * (self.ny - 1) as f64).clamp(0.0, (self.ny - 1) as f64);
+        let (x0, y0) = (gx as usize, gy as usize);
+        let (x1, y1) = ((x0 + 1).min(self.nx - 1), (y0 + 1).min(self.ny - 1));
+        let (fx, fy) = (gx - x0 as f64, gy - y0 as f64);
+        let g = |x: usize, y: usize| self.vals[y * self.nx + x];
+        (g(x0, y0) * (1.0 - fx) + g(x1, y0) * fx) * (1.0 - fy) + (g(x0, y1) * (1.0 - fx) + g(x1, y1) * fx) * fy
+    }
+}
+
+/// Share of the usable boxes the polynomial must keep for a field to count
+/// as sparse (sky nearly everywhere).
+const SPARSE_KEPT: f64 = 0.0;
+/// Mesh nodes along the longer side, and the smoothing in node spacings.
+const MESH_NODES: usize = 16;
+const MESH_SIGMA: f64 = 0.8;
+/// Boxes this many σ brighter than the median of their neighbours (within
+/// this many node spacings) are objects, not sky.
+const LOCAL_BRIGHT: f64 = 2.0;
+const LOCAL_REACH: f64 = 2.5;
 
 /// A fitted background surface over normalised coordinates (−1…1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -56,6 +93,9 @@ pub struct Model {
     /// The level the corrected image keeps (the surface's median).
     pub level: f64,
     pub correction: Correction,
+    /// Sparse fields: what the polynomial left, through the sky boxes.
+    #[serde(default)]
+    pub mesh: Option<Mesh>,
 }
 
 /// What the fit found, for the stage card.
@@ -100,7 +140,8 @@ impl Model {
         let (u, v) = self.uv(x, y);
         let mut t = [0f64; 15];
         terms(u, v, self.degree, &mut t);
-        self.coef.iter().zip(&t).map(|(c, t)| c * t).sum()
+        let p: f64 = self.coef.iter().zip(&t).map(|(c, t)| c * t).sum();
+        p + self.mesh.as_ref().map_or(0.0, |m| m.at(u, v))
     }
 
     /// Apply in place. Zero pixels (outside a registered frame) stay zero.
@@ -348,9 +389,15 @@ pub fn fit_samples(b: &Samples, s: &GradientSettings, degree: u32) -> Option<(Mo
             grid.push(eval(&coef, d, (i as f64 + 0.5) / 16.0 - 1.0, (j as f64 + 0.5) / 16.0 - 1.0));
         }
     }
+    let mesh = (s.follow_sky && keep.iter().filter(|k| **k).count() as f64 >= SPARSE_KEPT * b.pts.len() as f64).then(|| mesh_of(&b.pts, &keep, &coef, d, b.width, b.height));
+    if let Some(m) = &mesh {
+        for (k, g) in grid.iter_mut().enumerate() {
+            *g += m.at(((k % 32) as f64 + 0.5) / 16.0 - 1.0, ((k / 32) as f64 + 0.5) / 16.0 - 1.0);
+        }
+    }
     let (lo, hi) = grid.iter().fold((f64::MAX, f64::MIN), |(a, b), &v| (a.min(v), b.max(v)));
     let level = median(&mut grid);
-    let model = Model { degree: d, coef, width, height, level, correction: s.correction };
+    let model = Model { degree: d, coef, width, height, level, correction: s.correction, mesh };
     let lvl = level.abs().max(1e-12);
     let report = GradientReport {
         degree: d,
@@ -362,6 +409,55 @@ pub fn fit_samples(b: &Samples, s: &GradientSettings, degree: u32) -> Option<(Mo
         samples: b.pts.iter().zip(&keep).map(|(p, k)| (((p.0 + 1.0) / 2.0) as f32, ((p.1 + 1.0) / 2.0) as f32, *k)).collect(),
     };
     Some((model, report))
+}
+
+/// The mesh through the boxes' residuals from the polynomial. Every
+/// usable box takes part except those standing out from their neighbours
+/// (galaxies, clusters: brighter than the boxes around them), so smooth
+/// residue the polynomial can't follow (rings, patches from flats) is
+/// followed. Gaussian-weighted means at each node, fading to nothing far
+/// from any box.
+fn mesh_of(pts: &[(f64, f64, f64)], _keep: &[bool], coef: &[f64], d: u32, width: usize, height: usize) -> Mesh {
+    let long = width.max(height).max(1) as f64;
+    let (ax, ay) = (width as f64 / long, height as f64 / long);
+    let nx = ((MESH_NODES as f64 * ax).round() as usize).max(3);
+    let ny = ((MESH_NODES as f64 * ay).round() as usize).max(3);
+    let res: Vec<(f64, f64, f64)> = pts.iter().map(|&(u, v, z)| (u, v, z - eval(coef, d, u, v))).collect();
+    // Distances in units of the frame's long side.
+    let dist2 = |a: &(f64, f64, f64), b: &(f64, f64, f64)| ((a.0 - b.0) * ax).powi(2) + ((a.1 - b.1) * ay).powi(2);
+    let reach2 = (2.0 * LOCAL_REACH / MESH_NODES as f64).powi(2);
+    let mut keep = vec![true; res.len()];
+    for _ in 0..3 {
+        let local: Vec<f64> = res
+            .iter()
+            .map(|p| {
+                let mut v: Vec<f64> = res.iter().zip(&keep).filter(|(q, k)| **k && dist2(p, q) <= reach2).map(|(q, _)| q.2).collect();
+                if v.is_empty() { p.2 } else { median(&mut v) }
+            })
+            .collect();
+        let mut dev: Vec<f64> = res.iter().zip(&local).zip(&keep).filter(|(_, k)| **k).map(|((p, l), _)| (p.2 - l).abs()).collect();
+        let sigma = 1.4826 * median(&mut dev).max(1e-12);
+        let next: Vec<bool> = res.iter().zip(&local).map(|(p, l)| p.2 - l <= LOCAL_BRIGHT * sigma).collect();
+        if next == keep {
+            break;
+        }
+        keep = next;
+    }
+    let (su, sv) = (MESH_SIGMA * 2.0 / (nx - 1) as f64, MESH_SIGMA * 2.0 / (ny - 1) as f64);
+    let mut vals = Vec::with_capacity(nx * ny);
+    for j in 0..ny {
+        for i in 0..nx {
+            let (u, v) = (2.0 * i as f64 / (nx - 1) as f64 - 1.0, 2.0 * j as f64 / (ny - 1) as f64 - 1.0);
+            let (mut sw, mut sz) = (0.0, 0.0);
+            for (&(pu, pv, r), _) in res.iter().zip(&keep).filter(|(_, k)| **k) {
+                let wgt = (-0.5 * (((pu - u) / su).powi(2) + ((pv - v) / sv).powi(2))).exp();
+                sw += wgt;
+                sz += wgt * r;
+            }
+            vals.push(if sw > 0.0 { sz / sw * sw.min(1.0) } else { 0.0 });
+        }
+    }
+    Mesh { nx, ny, vals }
 }
 
 #[cfg(test)]

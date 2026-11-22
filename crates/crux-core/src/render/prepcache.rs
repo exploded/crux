@@ -20,7 +20,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Bump whenever `prepare` produces different results.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 12;
 const MAGIC: &[u8; 8] = b"CRUXPREP";
 
 /// Where a target's prepared cache lives.
@@ -56,6 +56,8 @@ struct Head {
     stars: StarSettings,
     n_stars: usize,
     star_cover: f64,
+    #[serde(default)]
+    thin: Option<super::Thin>,
     crop: (usize, usize, usize, usize),
     channels: Vec<ChanHead>,
     star_info: Vec<StarHead>,
@@ -142,6 +144,7 @@ pub fn save(file: &Path, sig: &str, p: &Prepared) -> Result<()> {
         stars: p.stars.clone(),
         n_stars: p.n_stars,
         star_cover: p.star_cover,
+        thin: p.thin.clone(),
         crop: p.crop,
         channels: p
             .channels
@@ -303,6 +306,7 @@ pub fn load(file: &Path, sig: &str) -> Option<Prepared> {
         stars: head.stars,
         n_stars: head.n_stars,
         star_cover: head.star_cover,
+        thin: head.thin,
         crop: head.crop,
         star_info: head.star_info.into_iter().map(|s| StarInfo { disc: s.disc, flux: s.flux, confidence: s.confidence }).collect(),
         paint_proxy,

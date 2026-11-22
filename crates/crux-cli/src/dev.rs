@@ -94,6 +94,24 @@ pub enum DevCmd {
         #[arg(long, default_value_t = 7)]
         step: usize,
     },
+    /// Render many recipes of one target as previews (the Image stage's
+    /// proxy, at most 1,200 px), preparing once per gradient and star
+    /// setting: for fitting stretch and colour settings. Also writes each
+    /// prepared target's measurements (`stats.json`).
+    RenderMany {
+        /// The data folder (with `--masters`: masters stacked elsewhere).
+        dir: PathBuf,
+        #[arg(long)]
+        masters: bool,
+        #[arg(long)]
+        workspace: PathBuf,
+        /// A folder of recipe files (`*.toml`); each renders to
+        /// `<out>/<file stem>.png`.
+        #[arg(long)]
+        recipes: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Inject a known gradient into a real master and measure how much of
     /// it the gradient fit recovers (the master's own background fitted
     /// first and taken off the comparison).
@@ -699,6 +717,7 @@ pub fn run(cmd: &DevCmd, triage: &dyn Fn(&std::path::Path) -> Result<crux_core::
                 compare_masters(out, c, &stars, m.fwhm.unwrap_or(3.0), None)?;
             }
         }
+        DevCmd::RenderMany { dir, masters, workspace, recipes, out } => render_many(dir, *masters, workspace, recipes, out)?,
         DevCmd::MixerDump { out, object, json, step } => {
             use crux_core::render::{self, palette, recipe::Recipe};
             let t = render::targets(out).into_iter().find(|t| object.as_ref().is_none_or(|o| &t.object == o)).ok_or_else(|| anyhow::anyhow!("no target"))?;
@@ -721,7 +740,7 @@ pub fn run(cmd: &DevCmd, triage: &dyn Fn(&std::path::Path) -> Result<crux_core::
                 palette::Stretching { neutral_sky: true, black: 0.7, background: 0.10, keep_colour: 0.3, ..Default::default() },
                 palette::Stretching { dark_ref: 0.3, keep_colour: 1.0, clip: 5.0, ..Default::default() },
             ];
-            let fins = [palette::Finishing::default(), palette::Finishing { luminance: 0.8, green: 0.6, saturation: 1.5 }, palette::Finishing { luminance: 0.0, green: 0.0, saturation: 1.0 }];
+            let fins = [palette::Finishing::default(), palette::Finishing { luminance: 0.8, green: 0.6, saturation: 1.5, detail: 0.0, chroma: 0.0, neutral: 0.0 }, palette::Finishing { luminance: 0.0, green: 0.0, saturation: 1.0, detail: 0.0, chroma: 0.0, neutral: 0.0 }];
             for (k, pr) in palette::presets(p.kind, &names).iter().enumerate() {
                 let mut r = Recipe::for_channels(&names);
                 r.stars.mode = render::stars::StarMode::Keep;
@@ -1051,4 +1070,62 @@ pub fn parse_wbpp_matrices(p: &std::path::Path) -> Result<Vec<(String, [f64; 9])
         }
     }
     Ok(out)
+}
+
+/// `crux dev render-many`.
+fn render_many(dir: &std::path::Path, masters: bool, workspace: &std::path::Path, recipes: &std::path::Path, out_dir: &std::path::Path) -> Result<()> {
+    use crux_core::render::{self, prepcache, recipe::Recipe};
+    let named = if masters && dir.file_name().is_some_and(|n| n.eq_ignore_ascii_case("master")) { dir.parent().unwrap_or(dir) } else { dir };
+    let out = process::job::out_dir(named, workspace);
+    let t = if masters {
+        render::targets_from_masters(dir, &named.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()).into_iter().next()
+    } else {
+        render::targets(&out).into_iter().next()
+    }
+    .ok_or_else(|| anyhow::anyhow!("no masters for {}", dir.display()))?;
+    let mut files: Vec<PathBuf> = std::fs::read_dir(recipes)?.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "toml")).collect();
+    files.sort();
+    std::fs::create_dir_all(out_dir)?;
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let names = t.channels();
+    let mut cache: Option<(String, render::Prepared)> = None;
+    let t0 = Instant::now();
+    let mut stats = serde_json::Map::new();
+    for f in &files {
+        let mut r = Recipe::load(f)?;
+        r.fit_to(&names);
+        let te = render::for_recipe(&t, &out, &r, &|_| {}, &cancel)?;
+        let sig = prepcache::signature(&te, &r.gradient, &r.stars);
+        if cache.as_ref().is_none_or(|(s, _)| *s != sig) {
+            let p = prepcache::prepare(&te, &out, &r.gradient, &r.stars, &cancel)?;
+            let ch: Vec<serde_json::Value> = p
+                .channels
+                .iter()
+                .map(|c| {
+                    let s = &c.stats;
+                    let q = |v: f64| crux_core::render::palette::quantile_of_sorted(&s.sorted, v);
+                    serde_json::json!({
+                        "name": c.name, "median": s.median, "mad": s.mad, "noise": s.noise, "sky_noise": s.sky_noise,
+                        "p_median": s.p_median, "p_high": s.p_high, "q005": q(0.005), "q05": q(0.05), "q25": q(0.25), "q75": q(0.75), "q99": q(0.99), "q999": q(0.999),
+                        "gradient": c.report.as_ref().map(|g| serde_json::json!({"degree": g.degree, "amplitude": g.amplitude_frac, "residual": g.residual_frac, "kept": g.kept, "usable": g.samples.len()})),
+                    })
+                })
+                .collect();
+            stats.insert(sig.clone(), serde_json::json!({"kind": format!("{:?}", p.kind), "stars": p.n_stars, "star_cover": p.star_cover, "channels": ch}));
+            cache = Some((sig, p));
+        }
+        let p = &cache.as_ref().unwrap().1;
+        let mut rgb = render::render_proxy(p, &r);
+        // The recipe's crop, else crux's own (empty and thinly covered edges).
+        if let Some(c) = r.crop.or_else(|| render::auto_crop(p)) {
+            let (x, y, w, h) = c.pixels(rgb.width, rgb.height);
+            let cut = |v: &[f32]| -> Vec<f32> { (y..y + h).flat_map(|yy| v[yy * rgb.width + x..yy * rgb.width + x + w].to_vec()).collect() };
+            rgb = render::Rgb { width: w, height: h, r: cut(&rgb.r), g: cut(&rgb.g), b: cut(&rgb.b) };
+        }
+        let stem = f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        render::write_png8(&out_dir.join(format!("{stem}.png")), &rgb)?;
+    }
+    std::fs::write(out_dir.join("stats.json"), serde_json::to_vec_pretty(&serde_json::Value::Object(stats))?)?;
+    println!("{}: {} renders in {:.1} s", t.object, files.len(), t0.elapsed().as_secs_f64());
+    Ok(())
 }

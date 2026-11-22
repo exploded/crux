@@ -78,24 +78,42 @@ pub struct StarSettings {
     pub size: f64,
     /// Separate stretch: star layer brightness (1 = as stretched).
     pub brightness: f64,
+    /// Separate stretch: light under this many noise sigmas of the star
+    /// layer is left out (2: crux's default). Higher drops faint stars and
+    /// halos; the bright stars barely change.
+    pub faint_cut: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StarEngine {
     /// crux's push-pull fill over the star discs, with matching noise.
-    #[default]
     Classic,
     /// crux's star remover network (`starnet`).
     Network,
 }
+
+/// The star remover when this build has crux's networks (James,
+/// 2026-11-21), else the classic fill.
+impl Default for StarEngine {
+    fn default() -> Self {
+        if cfg!(feature = "ml") {
+            StarEngine::Network
+        } else {
+            StarEngine::Classic
+        }
+    }
+}
+
+/// The star layer's default floor in noise sigmas (`StarSettings::faint_cut`).
+pub const STAR_FLOOR_SIGMAS: f64 = 2.0;
 
 /// The star layer's default stretch (`StarSettings::size`).
 pub const DEFAULT_SIZE: f64 = 0.6;
 
 impl Default for StarSettings {
     fn default() -> Self {
-        StarSettings { mode: StarMode::Natural, ha_to_green: 0.5, saturation: 1.0, grow: 1.0, sigma: 4.0, engine: StarEngine::Classic, separate: true, size: DEFAULT_SIZE, brightness: 1.0 }
+        StarSettings { mode: StarMode::Natural, ha_to_green: 0.5, saturation: 1.0, grow: 1.0, sigma: 4.0, engine: StarEngine::default(), separate: true, size: DEFAULT_SIZE, brightness: 1.0, faint_cut: STAR_FLOOR_SIGMAS }
     }
 }
 
@@ -385,6 +403,84 @@ pub fn mask(discs: &[Disc], w: usize, h: usize) -> Vec<f32> {
     m
 }
 
+/// Stars whose leftover glow is looked for, brightest first.
+const GLOW_STARS: usize = 400;
+/// A star's glow is looked for out to this many disc radii.
+const GLOW_REACH: f32 = 8.0;
+
+/// Take the round glows the starless image keeps around bright stars out of
+/// it (they go to the star layer instead, with the star's colour). Per star
+/// the glow is the starless image's median at each radius over the median
+/// of a ring just outside, kept only while it falls outwards: the round part
+/// alone, so nebula crossing a star stays. Narrowband glows differ by
+/// filter (OIII and SII glows are wider than Ha's), so in a palette they
+/// came out coloured (SHO: magenta halos).
+pub fn remove_glows(sl: &mut Image, orig: &Image, discs: &[Disc], noise: f32) {
+    let (w, h) = (sl.width, sl.height);
+    if (orig.width, orig.height) != (w, h) || noise <= 0.0 {
+        return;
+    }
+    let at = |img: &Image, x: f32, y: f32| img.data[(y as usize).min(h - 1) * w + (x as usize).min(w - 1)];
+    let mut bright: Vec<(f32, &Disc)> = discs.iter().map(|d| (at(orig, d.x, d.y) - at(sl, d.x, d.y), d)).filter(|(c, _)| *c > 50.0 * noise).collect();
+    bright.sort_by(|a, b| b.0.total_cmp(&a.0));
+    bright.truncate(GLOW_STARS);
+    for (_, d) in bright {
+        let reach = (GLOW_REACH * d.r).clamp(16.0, 160.0);
+        let outer = reach * 1.3;
+        let n = reach.ceil() as usize;
+        let mut rings: Vec<Vec<f32>> = vec![Vec::new(); n + 1];
+        let mut out_ring: Vec<f32> = Vec::new();
+        let (xa, xb) = ((d.x - outer).floor().max(0.0) as usize, ((d.x + outer).ceil() as usize).min(w - 1));
+        let (ya, yb) = ((d.y - outer).floor().max(0.0) as usize, ((d.y + outer).ceil() as usize).min(h - 1));
+        for y in ya..=yb {
+            for x in xa..=xb {
+                let r = ((x as f32 + 0.5 - d.x).powi(2) + (y as f32 + 0.5 - d.y).powi(2)).sqrt();
+                let v = sl.data[y * w + x];
+                if r < reach {
+                    rings[r as usize].push(v);
+                } else if r < outer {
+                    out_ring.push(v);
+                }
+            }
+        }
+        if out_ring.len() < 20 {
+            continue;
+        }
+        let bg = crate::stats::median_mut(&mut out_ring);
+        // Excess per radius (zero at the reach).
+        let e: Vec<f32> = (0..=n).map(|k| if k < n && rings[k].len() >= 3 { (crate::stats::median_mut(&mut rings[k]) - bg).max(0.0) } else { 0.0 }).collect();
+        // From the brightest radius near the centre outwards it may only
+        // fall: a nebula bump further out is left alone.
+        let k0 = (0..((d.r.ceil() as usize).max(3)).min(n)).max_by(|a, b| e[*a].total_cmp(&e[*b])).unwrap_or(0);
+        if e[k0] < 2.0 * noise {
+            continue;
+        }
+        let mut ex = vec![0f32; n + 1];
+        let mut run = e[k0];
+        for k in 0..=n {
+            if k > k0 {
+                run = run.min(e[k]);
+            }
+            ex[k] = run;
+        }
+        for k in 0..=n {
+            ex[k] *= 1.0 - (k as f32 / reach).min(1.0).powi(2);
+        }
+        for y in ya..=yb {
+            for x in xa..=xb {
+                let r = ((x as f32 + 0.5 - d.x).powi(2) + (y as f32 + 0.5 - d.y).powi(2)).sqrt();
+                if r < reach {
+                    let k = r as usize;
+                    let f = r - k as f32;
+                    let e = ex[k] * (1.0 - f) + ex[(k + 1).min(n)] * f;
+                    let i = y * w + x;
+                    sl.data[i] = (sl.data[i] - e).max(bg.min(sl.data[i]));
+                }
+            }
+        }
+    }
+}
+
 /// Fill where `weight` < 1 from the surroundings: push-pull over a 2×
 /// pyramid (weighted means down, bilinear blending up).
 pub fn fill(data: &[f32], weight: &[f32], w: usize, h: usize) -> Vec<f32> {
@@ -478,6 +574,10 @@ pub struct Colour {
     pub gain_s: f32,
     pub ha_to_green: f32,
     pub saturation: f32,
+    /// Broadband: the R, G and B channels and their median-star-white
+    /// gains; the star's colour is its own light in each (H, O and S
+    /// above are unused).
+    pub rgb: Option<([usize; 3], [f32; 3])>,
 }
 
 /// Combine one pixel: `full` and `bare` are the finished renders with and
@@ -506,6 +606,9 @@ pub fn combine(full: [f32; 3], bare: [f32; 3], lin: &dyn Fn(usize) -> f32, conf:
 /// red, green from Ha would outshine both and give green "stars").
 #[inline]
 pub fn rgb_of(lin: &dyn Fn(usize) -> f32, c: &Colour) -> [f32; 3] {
+    if let Some((ch, g)) = c.rgb {
+        return std::array::from_fn(|k| lin(ch[k]).max(0.0) * g[k]);
+    }
     let h = lin(c.h).max(0.0);
     let o = lin(c.o).max(0.0) * c.gain_o;
     let r = match c.s {
@@ -574,6 +677,9 @@ impl Curve {
     }
 }
 
+/// How much of the palette's colour light outside measured stars keeps.
+const HUE_KEEP: f32 = 0.25;
+
 /// One pixel of the separate stretch. `base`: the finished starless pixel;
 /// `light`: the star layer's linear light per channel (above its floor);
 /// `star`: the painted star's light, with `conf` its confidence (0 where no
@@ -590,7 +696,9 @@ pub fn screen(base: [f32; 3], light: &dyn Fn(usize) -> f32, star: &dyn Fn(usize)
     let conf = conf.clamp(0.0, 1.0);
     let sc = if conf > 0.0 { colour_of(star, c) } else { [1.0; 3] };
     let hm = (hue[0] + hue[1] + hue[2]) / 3.0;
-    let hc: [f32; 3] = if hm > 1.0e-4 { std::array::from_fn(|k| hue[k] / hm) } else { [1.0; 3] };
+    // Mostly neutral: at a star's halo the palette's colour is the mix's
+    // (SHO puts Ha in green, scaled down, so halos came out magenta).
+    let hc: [f32; 3] = if hm > 1.0e-4 { std::array::from_fn(|k| 1.0 + HUE_KEEP * (hue[k] / hm - 1.0)) } else { [1.0; 3] };
     let col = unclipped(std::array::from_fn(|k| conf * sc[k] + (1.0 - conf) * hc[k]), y);
     std::array::from_fn(|k| {
         let s = (y * col[k]).clamp(0.0, 1.0);
@@ -601,6 +709,36 @@ pub fn screen(base: [f32; 3], light: &dyn Fn(usize) -> f32, star: &dyn Fn(usize)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn takes_a_round_glow_out_of_the_starless_image() {
+        let (w, h) = (300usize, 300usize);
+        let mut rng = 12345u64;
+        let mut noise = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((rng >> 33) as f32 / (1u64 << 31) as f32 - 0.5) * 0.002
+        };
+        let (cx, cy) = (150.5f32, 150.5f32);
+        let mut sl = Image::new(w, h);
+        let mut orig = Image::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let r2 = (x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2);
+                // Sky, a nebula band crossing the star, and the glow.
+                let band = if (y as f32 - 150.0).abs() < 4.0 { 0.02 } else { 0.0 };
+                let v = 0.1 + band + 0.02 * (-r2 / (2.0 * 12.0f32.powi(2))).exp() + noise();
+                sl.data[y * w + x] = v;
+                orig.data[y * w + x] = v + 0.8 * (-r2 / (2.0 * 2.0f32.powi(2))).exp();
+            }
+        }
+        let disc = Disc { x: cx, y: cy, r: 6.0, peaked: 3.0 };
+        remove_glows(&mut sl, &orig, &[disc], 0.0006);
+        // The glow goes (4 px from the star, off the band) …
+        assert!((sl.get(154, 135) - 0.1).abs() < 0.004, "glow left: {}", sl.get(154, 135));
+        // … the band crossing it stays, and so does the far sky.
+        assert!(sl.get(130, 150) - 0.1 > 0.015, "band lost: {}", sl.get(130, 150));
+        assert!((sl.get(10, 10) - 0.1).abs() < 0.002);
+    }
 
     #[test]
     fn removes_stars_and_keeps_the_sky() {
@@ -626,7 +764,7 @@ mod tests {
 
     #[test]
     fn natural_colour_is_white_for_a_median_star_and_neutral_off_stars() {
-        let c = Colour { h: 0, o: 1, s: None, gain_o: 2.0, gain_s: 1.0, ha_to_green: 0.3, saturation: 1.0 };
+        let c = Colour { h: 0, o: 1, s: None, gain_o: 2.0, gain_s: 1.0, ha_to_green: 0.3, saturation: 1.0, rgb: None };
         // A star whose OIII is half its Ha (gain 2 makes them equal): white.
         let lin = |i: usize| if i == 0 { 0.01 } else { 0.005 };
         let out = combine([0.8, 0.5, 0.7], [0.0, 0.0, 0.0], &lin, 1.0, &c);
@@ -642,7 +780,7 @@ mod tests {
 
     #[test]
     fn separate_stars_screen_onto_the_starless_image() {
-        let c = Colour { h: 0, o: 1, s: None, gain_o: 2.0, gain_s: 1.0, ha_to_green: 0.5, saturation: 1.0 };
+        let c = Colour { h: 0, o: 1, s: None, gain_o: 2.0, gain_s: 1.0, ha_to_green: 0.5, saturation: 1.0, rgb: None };
         let curve = Curve::new(1.0e-3, 2.8, 0.15, 1.0, 1.0);
         // No star light: the starless pixel unchanged.
         let base = [0.3, 0.2, 0.25];

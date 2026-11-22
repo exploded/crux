@@ -193,11 +193,16 @@ pub struct Stretching {
     pub dark_ref: f64,
     /// Fraction of colour-preserving stretch.
     pub keep_colour: f64,
+    /// Highlight protection, 0–1: a shoulder above the background pulls
+    /// bright nebula down (1: full scale lands at about half way between
+    /// the background and white), keeping each pixel's colour. 0 is the
+    /// mixer's curve.
+    pub highlights: f64,
 }
 
 impl Default for Stretching {
     fn default() -> Self {
-        Stretching { linear: true, background: 0.15, black: 0.0, clip: 2.8, neutral_sky: false, dark_ref: 0.10, keep_colour: 0.0 }
+        Stretching { linear: true, background: 0.11, black: 0.0, clip: 2.8, neutral_sky: false, dark_ref: 0.10, keep_colour: 0.0, highlights: 0.0 }
     }
 }
 
@@ -212,11 +217,23 @@ pub struct Finishing {
     pub green: f64,
     /// Saturation (1 = unchanged).
     pub saturation: f64,
+    /// Nebula detail, 0–1: large-scale local contrast on the starless
+    /// image (stars stretched separately only); 0 leaves it as stretched.
+    pub detail: f64,
+    /// Colour noise reduction, 0–1: the faint parts of the starless image
+    /// take the colour of their surroundings (stars stretched separately
+    /// only); bright nebula keeps its own.
+    pub chroma: f64,
+    /// Neutral background, 0–1: takes the faint sky's colour tint out,
+    /// measured region by region (a palette's boosted weak lines tint the
+    /// faint sky), fading out towards the nebula (stars stretched
+    /// separately, narrowband only).
+    pub neutral: f64,
 }
 
 impl Default for Finishing {
     fn default() -> Self {
-        Finishing { luminance: 0.5, green: 0.0, saturation: 1.3 }
+        Finishing { luminance: 0.5, green: 0.0, saturation: 1.3, detail: 0.0, chroma: 0.0, neutral: 1.0 }
     }
 }
 
@@ -299,7 +316,7 @@ pub fn presets(kind: Kind, channels: &[String]) -> Vec<Preset> {
             let rgb = vec![("R", [1.0, 0.0, 0.0]), ("G", [0.0, 1.0, 0.0]), ("B", [0.0, 0.0, 1.0])];
             let has_h = channels.iter().any(|c| c == "H");
             let has_l = channels.iter().any(|c| c == "L");
-            let fin = |lum: f64, sat: f64| Some(Finishing { luminance: lum, green: 0.0, saturation: sat });
+            let fin = |lum: f64, sat: f64| Some(Finishing { luminance: lum, green: 0.0, saturation: sat, detail: 0.0, chroma: 0.0, neutral: 0.0 });
             let mut v = vec![
                 Preset { name: "Natural", weights: rgb.clone(), balance: Balance::Stars, stretch: None, finish: fin(if has_l { 0.8 } else { 0.0 }, 1.2) },
                 Preset { name: "Vivid", weights: rgb.clone(), balance: Balance::Stars, stretch: None, finish: fin(if has_l { 0.8 } else { 0.0 }, 1.6) },
@@ -324,7 +341,7 @@ pub fn presets(kind: Kind, channels: &[String]) -> Vec<Preset> {
                 _ => "*",
             };
             let st = |bg: f64, black: f64| Some(Stretching { background: bg, black, ..Stretching::default() });
-            let mono = |name, bg, black| Preset { name, weights: vec![(c, [1.0, 1.0, 1.0])], balance: Balance::None, stretch: st(bg, black), finish: Some(Finishing { luminance: 0.0, green: 0.0, saturation: 1.0 }) };
+            let mono = |name, bg, black| Preset { name, weights: vec![(c, [1.0, 1.0, 1.0])], balance: Balance::None, stretch: st(bg, black), finish: Some(Finishing { luminance: 0.0, green: 0.0, saturation: 1.0, detail: 0.0, chroma: 0.0, neutral: 0.0 }) };
             vec![mono("Natural", 0.15, 0.0), mono("Gentle", 0.10, 0.0), mono("Strong", 0.25, 0.0), mono("Black sky", 0.12, 0.6)]
         }
     }
@@ -372,6 +389,9 @@ pub struct Coef {
     pub luminance: f64,
     pub green: f64,
     pub saturation: f64,
+    /// Highlight shoulder: strength (0–0.5) and knee (the background's
+    /// output level).
+    pub shoulder: (f64, f64),
     pub gain: Vec<f64>,
     /// (channel, wanted gain, used gain) where the boost limit applied.
     pub limited: Vec<(usize, f64, f64)>,
@@ -502,6 +522,10 @@ pub fn coefficients(channels: &[String], stats: &[&Stats], star_gain: Option<&[f
         luminance: fin.luminance,
         green: fin.green,
         saturation: fin.saturation,
+        shoulder: {
+            let blk = if st.linear { st.black * st.background } else { 0.0 };
+            (0.5 * st.highlights.clamp(0.0, 1.0), ((st.background - blk) / (1.0 - blk)).clamp(0.0, 0.95))
+        },
         gain,
         limited,
     }
@@ -514,6 +538,7 @@ pub fn process(ch: &[&[f32]], coef: &Coef, out_r: &mut [f32], out_g: &mut [f32],
     let inv = [1.0 / (1.0 - coef.bp[0]), 1.0 / (1.0 - coef.bp[1]), 1.0 / (1.0 - coef.bp[2])];
     let (keep, green, lum, sat) = (coef.keep_colour, coef.green, coef.luminance, coef.saturation);
     let blk = coef.black;
+    let (hs, knee) = coef.shoulder;
     let iblk = 1.0 / (1.0 - blk);
     let lum_ch = coef.lum.filter(|_| lum > 0.0);
     let active: Vec<usize> = (0..n).filter(|&i| coef.a.iter().any(|row| row[i] != 0.0)).collect();
@@ -570,6 +595,16 @@ pub fn process(ch: &[&[f32]], coef: &Coef, out_r: &mut [f32], out_g: &mut [f32],
             r = (r - blk) * iblk;
             g = (g - blk) * iblk;
             b = (b - blk) * iblk;
+        }
+        if hs > 0.0 {
+            let m = r.max(g).max(b);
+            if m > knee {
+                let y = m.min(1.0);
+                let f = (y - hs * (y - knee) * (y - knee) / (1.0 - knee)) / m;
+                r *= f;
+                g *= f;
+                b *= f;
+            }
         }
         out_r[p] = r.clamp(0.0, 1.0) as f32;
         out_g[p] = g.clamp(0.0, 1.0) as f32;
@@ -675,6 +710,44 @@ mod tests {
     }
 
     #[test]
+    fn highlights_pull_bright_pixels_down_keeping_colour() {
+        let ch = vec!["H".to_string()];
+        let px: Vec<f32> = (0..4000).map(|i| 0.01 + 0.5 * (i as f32 / 4000.0).powi(3)).collect();
+        let s = Stats::measure(&px, &px);
+        let mix = Mix { preset: String::new(), balance: Balance::None, weights: [("H".to_string(), [1.0, 0.6, 0.3])].into_iter().collect() };
+        let fin = Finishing { luminance: 0.0, green: 0.0, saturation: 1.0, detail: 0.0, chroma: 0.0, neutral: 0.0 };
+        let run = |h: f64| {
+            let st = Stretching { highlights: h, ..Default::default() };
+            let c = coefficients(&ch, &[&s], None, &mix, &st, &fin);
+            let (mut r, mut g, mut b) = (vec![0f32; px.len()], vec![0f32; px.len()], vec![0f32; px.len()]);
+            process(&[&px], &c, &mut r, &mut g, &mut b);
+            (r, g, b)
+        };
+        let (r0, g0, _) = run(0.0);
+        let (r1, g1, _) = run(1.0);
+        let mut changed = 0;
+        for i in 0..px.len() {
+            // Never brighter; dark pixels (under the background) untouched.
+            assert!(r1[i] <= r0[i] + 1e-6);
+            if r0[i] < 0.14 {
+                assert!((r1[i] - r0[i]).abs() < 1e-6);
+            }
+            // Hue kept: the red to green ratio is unchanged.
+            if r0[i] > 0.3 && r0[i] < 0.99 {
+                assert!((g1[i] / r1[i] - g0[i] / r0[i]).abs() < 1e-3);
+                changed += 1;
+            }
+        }
+        assert!(changed > 100);
+        // The brightest pixel follows the shoulder: y − ½(y − k)²/(1 − k),
+        // k the background (0.15).
+        let y = r0.iter().cloned().fold(0.0f32, f32::max) as f64;
+        let top = r1.iter().cloned().fold(0.0f32, f32::max) as f64;
+        let want = y - 0.5 * (y - 0.15).powi(2) / 0.85;
+        assert!((top - want).abs() < 0.01, "{top} {want}");
+    }
+
+    #[test]
     fn neutral_where_every_line_is_dark() {
         // At each line's dark level all three outputs are equal, for any mix.
         let ch = vec!["H".to_string(), "O".to_string(), "S".to_string()];
@@ -684,7 +757,7 @@ mod tests {
         };
         let stats = vec![mk(0.02, 0.02), mk(0.01, 0.003), mk(0.015, 0.002)];
         let st = Stretching { keep_colour: 0.0, ..Default::default() };
-        let fin = Finishing { luminance: 0.0, green: 0.0, saturation: 1.3 };
+        let fin = Finishing { luminance: 0.0, green: 0.0, saturation: 1.3, detail: 0.0, chroma: 0.0, neutral: 0.0 };
         for pr in presets(Kind::Narrowband, &ch) {
             let mix = mix_of(&pr, &ch);
             let sr: Vec<&Stats> = stats.iter().collect();
