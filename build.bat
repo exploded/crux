@@ -8,7 +8,8 @@ rem   build.bat test           -> cargo test
 rem   build.bat platforms      -> type-check for Linux and macOS (no linking;
 rem                               without SQLite, whose C source needs a
 rem                               cross compiler: the index falls back to JSON
-rem                               and there's no flat library)
+rem                               and there's no flat library; then again
+rem                               with the graphics card code)
 rem   build.bat run -- report C:\PixInsight\...
 set "PATH=%USERPROFILE%\.cargo\bin;%PATH%;C:\msys64\ucrt64\bin"
 if "%~1"=="platforms" goto platforms
@@ -39,6 +40,10 @@ exit /b 0
 :platforms
 cargo check --workspace --all-targets --no-default-features --target x86_64-unknown-linux-gnu || exit /b 1
 cargo check --workspace --all-targets --no-default-features --target aarch64-apple-darwin || exit /b 1
+rem The graphics card code (wgpu: Vulkan on Linux, Metal on macOS) needs no
+rem C compiler, so it's checked too.
+cargo check --workspace --all-targets --no-default-features --features gpu --target x86_64-unknown-linux-gnu || exit /b 1
+cargo check --workspace --all-targets --no-default-features --features gpu --target aarch64-apple-darwin || exit /b 1
 exit /b 0
 
 :passthru

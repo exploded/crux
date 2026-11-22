@@ -528,6 +528,7 @@ pub fn integrate(
     cancel: &AtomicBool,
 ) -> Result<Report> {
     let t0 = std::time::Instant::now();
+    let laps = crate::timing::Laps::new(format!("integrate {object} {filter}"));
     let n = inputs.len();
     anyhow::ensure!(n > 0 && reference < n, "nothing to integrate");
     // Aperture: twice the worst FWHM, 3–15 px.
@@ -553,6 +554,7 @@ pub fn integrate(
         })
         .collect();
     let measured: Vec<Measured> = measured.into_iter().collect::<Result<_>>()?;
+    laps.lap(&format!("{n} frames measured"));
     let (w, h) = match &measured[reference].rows {
         Rows::Seek(l) => (l.width, l.height),
         Rows::Whole(i) => (i.width, i.height),
@@ -712,6 +714,7 @@ pub fn integrate(
             Ok((counts, clamped))
         })
         .collect();
+    laps.lap("combined");
     let mut counts = vec![(0u64, 0u64, 0u64); n];
     let mut clamped = 0u64;
     for r in per_strip {

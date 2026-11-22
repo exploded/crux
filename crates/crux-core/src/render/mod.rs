@@ -365,11 +365,15 @@ pub fn prepare(t: &Target, g: &GradientSettings, st: &stars::StarSettings, keep_
                     Some((md, rp)) => (Some(md), Some(rp)),
                     None => (None, None),
                 };
+                let laps = crate::timing::Laps::new(format!("prepare {}", m.channel));
                 let px = if model.is_some() { proxy(&img, PROXY_MAX) } else { raw_proxy.clone() };
+                laps.lap("proxy");
                 let mut stats = Stats::measure(&img.data, &px.data);
                 stats.sky_noise = m.noise;
+                laps.lap("stats");
                 let noise_full = crate::process::combine::noise_of(&img);
                 let noise_proxy = crate::process::combine::noise_of(&px);
+                laps.lap("noise");
                 // The star remover's starless master when chosen (made by
                 // `starnet`), corrected like the master; else the classic fill.
                 let net_sl = (st.engine == stars::StarEngine::Network)
@@ -383,7 +387,9 @@ pub fn prepare(t: &Target, g: &GradientSettings, st: &stars::StarSettings, keep_
                         s
                     });
                 let sl = mask.as_ref().map(|mk| net_sl.unwrap_or_else(|| stars::starless(&img, mk, noise_full, k as u64 + 1)));
+                laps.lap("starless");
                 let nebula = sl.as_ref().map(|s| stars::glow_nebula(s, &img, &discs, noise_full)).unwrap_or_default();
+                laps.lap("glows around nebula");
                 (m, img, raw_proxy, model, report, px, stats, noise_full, noise_proxy, sl, nebula)
             })
             .collect()
@@ -399,15 +405,19 @@ pub fn prepare(t: &Target, g: &GradientSettings, st: &stars::StarSettings, keep_
         first
             .into_par_iter()
             .map(|(m, img, raw_proxy, model, report, px, stats, noise_full, noise_proxy, sl, _)| {
+                let laps = crate::timing::Laps::new(format!("prepare {}", m.channel));
                 let sl = sl.map(|mut s| {
                     stars::remove_glows(&mut s, &img, &discs, noise_full, &keep);
                     s
                 });
+                laps.lap("glows removed");
                 let sl_proxy = sl.as_ref().map(|s| proxy(s, PROXY_MAX));
                 let stats_starless = sl.as_ref().zip(sl_proxy.as_ref()).map(|(s, sp)| Stats { sky_noise: m.noise, ..Stats::measure(&s.data, &sp.data) });
+                laps.lap("starless stats");
                 let crop = cut(&img);
                 let crop_starless = sl.as_ref().map(&cut);
                 let thin = thin_edges(&img);
+                laps.lap("thin edges");
                 (m, img, raw_proxy, model, report, px, stats, noise_full, noise_proxy, sl, sl_proxy, stats_starless, crop, crop_starless, thin)
             })
             .collect()
@@ -454,14 +464,18 @@ pub fn prepare(t: &Target, g: &GradientSettings, st: &stars::StarSettings, keep_
         let hi = names.iter().position(|c| c == "H").or(names.iter().position(|c| c == "S")).unwrap_or(0);
         let with: Vec<&Image> = fulls_kept.iter().collect();
         let without: Vec<&Image> = starless_kept.iter().collect();
+        let laps = crate::timing::Laps::new("prepare stars");
         star_info = stars::measure(&discs, &with, &without, hi, channels[hi].noise_full);
+        laps.lap("measured");
         let n = channels.len();
         let (pw, ph) = (channels[0].proxy.width, channels[0].proxy.height);
         paint_proxy = Some(stars::paint(&star_info, n, pw, ph, pw as f32 / width as f32, 0.0, 0.0));
         let (x0, y0, cw, ch) = crop_rect;
         paint_crop = Some(stars::paint(&star_info, n, cw, ch, 1.0, x0 as f32, y0 as f32));
+        laps.lap("painted at proxy and crop size");
         if keep_full {
             paint_full = Some(stars::paint(&star_info, n, width, height, 1.0, 0.0, 0.0));
+            laps.lap("painted at full size");
             for ((c, f), s) in channels.iter_mut().zip(fulls_kept).zip(starless_kept) {
                 c.full = Some(f);
                 c.starless = Some(s);
@@ -1063,6 +1077,7 @@ pub fn render_tile(p: &Prepared, r: &Recipe, max: usize) -> Rgb {
 /// Render at full resolution (needs `prepare(.., keep_full = true)`),
 /// cropped as the recipe says.
 pub fn render_full(p: &Prepared, r: &Recipe) -> Result<Rgb> {
+    let laps = crate::timing::Laps::new("render_full");
     let coef = coefficients(p, r);
     let planes: Vec<&[f32]> = p.channels.iter().map(|c| c.full.as_ref().map(|i| i.data.as_slice())).collect::<Option<_>>().ok_or_else(|| anyhow::anyhow!("full-resolution channels weren't kept"))?;
     let col = colour(p, r);
@@ -1072,11 +1087,15 @@ pub fn render_full(p: &Prepared, r: &Recipe) -> Result<Rgb> {
     let crop: Vec<&[f32]> = p.channels.iter().map(|c| c.crop.data.as_slice()).collect();
     let crop_bare: Option<Vec<&[f32]>> = p.channels.iter().map(|c| c.crop_starless.as_ref().map(|i| i.data.as_slice())).collect();
     let split = bare.as_ref().and(crop_bare.as_ref()).and_then(|b| split_of(p, r, &crop, b, Frame::whole(p, p.width, p.height)));
+    laps.lap("coefficients and split");
     let rgb = render_planes(&planes, bare.as_deref(), p.width, p.height, &coef, col.as_ref().zip(p.paint_full.as_ref()), split.as_ref());
-    Ok(match &r.crop {
+    laps.lap("planes");
+    let rgb = match &r.crop {
         Some(c) if !c.is_whole() => rgb.cropped(c),
         _ => rgb,
-    })
+    };
+    laps.lap("crop");
+    Ok(rgb)
 }
 
 /// The largest rectangle with data in every channel: trims the empty
@@ -1310,19 +1329,30 @@ pub fn write(rgb: &Rgb, dir: &Path, object: &str, recipe: &Recipe, extra: &Heade
     h.push("IMAGETYP", "Processed", "");
     h.push("CRUX-RCP", &recipe.name, "crux recipe");
     h.push("CRUX-RCV", &recipe.version.to_string(), "crux recipe format");
+    let laps = crate::timing::Laps::new(format!("write {object}"));
     let grey = rgb.is_grey();
     let planes: Vec<&[f32]> = if grey { vec![&rgb.r] } else { vec![&rgb.r, &rgb.g, &rgb.b] };
-    crate::xisf::write_planes(&xisf, rgb.width, rgb.height, &planes, &h, &[("Crux:Recipe", &recipe.to_toml())])?;
-    let fits = if fits {
-        let p = crate::fits::copy_path(&xisf);
-        crate::fits::write_file(&p, |t| crate::fits::write_planes(t, rgb.width, rgb.height, &planes, &h))?;
-        Some(p)
-    } else {
-        None
-    };
-    write_png16(&png, rgb, grey)?;
-    write_jpeg(&jpg, rgb, grey, JPEG_QUALITY)?;
-    write_png8(&preview, &shrink(rgb, PROXY_MAX))?;
+    // The files are independent: written at the same time (the PNG and
+    // JPEG encoders are single-threaded).
+    let (fits, r_png, r_jpg, r_prev) = std::thread::scope(|sc| -> Result<_> {
+        let png_t = sc.spawn(|| write_png16(&png, rgb, grey));
+        let jpg_t = sc.spawn(|| write_jpeg(&jpg, rgb, grey, JPEG_QUALITY));
+        let prev_t = sc.spawn(|| write_png8(&preview, &shrink(rgb, PROXY_MAX)));
+        crate::xisf::write_planes(&xisf, rgb.width, rgb.height, &planes, &h, &[("Crux:Recipe", &recipe.to_toml())])?;
+        let fits = if fits {
+            let p = crate::fits::copy_path(&xisf);
+            crate::fits::write_file(&p, |t| crate::fits::write_planes(t, rgb.width, rgb.height, &planes, &h))?;
+            Some(p)
+        } else {
+            None
+        };
+        let join = |t: std::thread::ScopedJoinHandle<'_, Result<()>>| t.join().unwrap_or_else(|_| Err(anyhow::anyhow!("a writer thread panicked")));
+        Ok((fits, join(png_t), join(jpg_t), join(prev_t)))
+    })?;
+    r_png?;
+    r_jpg?;
+    r_prev?;
+    laps.lap("XISF, PNG and JPEG");
     let rp = dir.join("recipe.toml");
     recipe.save(&rp)?;
     Ok(Written { xisf, fits, png, jpg, preview, recipe: rp, seconds: t0.elapsed().as_secs_f64(), width: rgb.width, height: rgb.height })
@@ -1372,9 +1402,9 @@ pub fn write_jpeg(path: &Path, rgb: &Rgb, grey: bool, quality: u8) -> Result<()>
     let f = std::io::BufWriter::new(std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?);
     let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     let (data, kind): (Vec<u8>, image::ExtendedColorType) = if grey {
-        (rgb.r.iter().map(|v| q(*v)).collect(), image::ExtendedColorType::L8)
+        (pack(rgb, 1, |i, o| o[0] = q(rgb.r[i])), image::ExtendedColorType::L8)
     } else {
-        ((0..rgb.r.len()).flat_map(|i| [q(rgb.r[i]), q(rgb.g[i]), q(rgb.b[i])]).collect(), image::ExtendedColorType::Rgb8)
+        (pack(rgb, 3, |i, o| o.copy_from_slice(&[q(rgb.r[i]), q(rgb.g[i]), q(rgb.b[i])])), image::ExtendedColorType::Rgb8)
     };
     image::codecs::jpeg::JpegEncoder::new_with_quality(f, quality)
         .write_image(&data, rgb.width as u32, rgb.height as u32, kind)
@@ -1390,9 +1420,22 @@ pub fn write_png8(path: &Path, rgb: &Rgb) -> Result<()> {
     e.set_depth(png::BitDepth::Eight);
     let mut w = e.write_header()?;
     let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-    let data: Vec<u8> = (0..rgb.r.len()).flat_map(|i| [q(rgb.r[i]), q(rgb.g[i]), q(rgb.b[i])]).collect();
+    let data = pack(rgb, 3, |i, o| o.copy_from_slice(&[q(rgb.r[i]), q(rgb.g[i]), q(rgb.b[i])]));
     w.write_image_data(&data)?;
     Ok(())
+}
+
+/// Interleaved bytes, `per` per pixel, filled by `f(pixel, bytes)` in
+/// parallel.
+fn pack(rgb: &Rgb, per: usize, f: impl Fn(usize, &mut [u8]) + Sync) -> Vec<u8> {
+    use rayon::prelude::*;
+    let mut data = vec![0u8; rgb.r.len() * per];
+    data.par_chunks_mut(per * 4096).enumerate().for_each(|(c, chunk)| {
+        for (j, o) in chunk.chunks_mut(per).enumerate() {
+            f(c * 4096 + j, o);
+        }
+    });
+    data
 }
 
 /// 16-bit PNG (grey when every pixel is).
@@ -1404,15 +1447,14 @@ pub fn write_png16(path: &Path, rgb: &Rgb, grey: bool) -> Result<()> {
     e.set_compression(png::Compression::Fast);
     let mut w = e.write_header()?;
     let ch = if grey { 1 } else { 3 };
-    let mut data = Vec::with_capacity(rgb.r.len() * 2 * ch);
     let q = |v: f32| ((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_be_bytes();
-    for i in 0..rgb.r.len() {
-        data.extend_from_slice(&q(rgb.r[i]));
+    let data = pack(rgb, 2 * ch, |i, o| {
+        o[..2].copy_from_slice(&q(rgb.r[i]));
         if !grey {
-            data.extend_from_slice(&q(rgb.g[i]));
-            data.extend_from_slice(&q(rgb.b[i]));
+            o[2..4].copy_from_slice(&q(rgb.g[i]));
+            o[4..6].copy_from_slice(&q(rgb.b[i]));
         }
-    }
+    });
     w.write_image_data(&data)?;
     Ok(())
 }

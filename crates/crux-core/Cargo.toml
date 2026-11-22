@@ -26,12 +26,19 @@ png = "0.17"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 rusqlite = { workspace = true, optional = true }
 tract-onnx = { version = "0.23", optional = true }
+wgpu = { version = "30", optional = true, default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "wgsl"] }
+pollster = { version = "1", optional = true }
+bytemuck = { version = "1", optional = true, features = ["derive"] }
 
 [features]
-default = ["sqlite", "ml"]
+default = ["sqlite", "ml", "gpu"]
 # The library index in SQLite (compiles SQLite's C source). Without it the
 # index is JSON; `build.bat platforms` checks that way (no cross C compiler).
 sqlite = ["dep:rusqlite"]
 # crux's trained networks (denoiser, star corrector), run on the CPU with
 # tract; the models are compiled in (models/).
 ml = ["dep:tract-onnx"]
+# Compute on the graphics card through wgpu (DX12, Vulkan or Metal): the
+# networks (with `ml`), warps. Everything falls back to the CPU when no
+# suitable adapter is found or it fails.
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]

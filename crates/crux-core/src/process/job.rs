@@ -1058,73 +1058,69 @@ pub fn run_with(plan: &Plan, loaded: &mut Loaded, progress: &(dyn Fn(Event) + Sy
     let mut order: Vec<(&FieldPlan, &LightItem)> = plan.fields.iter().flat_map(|f| f.lights.iter().map(move |l| (f, l))).collect();
     order.sort_by_key(|(_, l)| l.cal);
     let mut current: Option<(usize, Calibrator, String)> = None;
-    for (field, l) in order {
-        if cancel.load(Ordering::Relaxed) {
-            rep.cancelled = true;
-            break;
-        }
-        let cal_sig = cal_sigs.entry(l.cal).or_insert_with(|| cal_setup_sig(&plan.cals[l.cal])).clone();
-        let sig = light_sig(field, l, &cal_sig, &settings_sig);
-        let key = crate::paths::key(&l.registered);
-        let up_to_date = light_up_to_date(l, &manifest, &sig);
-        let t1 = Instant::now();
-        let mut res = LightResult { skipped_up_to_date: up_to_date, ..Default::default() };
-        if !up_to_date {
-            let r: Result<CalStats> = (|| {
-                if current.as_ref().is_none_or(|c| c.0 != l.cal) {
-                    let c = build_calibrator(plan, l.cal, plan.settings.cal.clone(), &mut manifest, loaded, &mut rep.masters_built, progress)?;
-                    current = Some((l.cal, c, cal_sig.clone()));
+    // What each light needs, in order; up-to-date ones are only reported.
+    struct Work<'a> {
+        field: &'a FieldPlan,
+        l: &'a LightItem,
+        sig: String,
+        key: String,
+        cal_sig: String,
+        up_to_date: bool,
+    }
+    let work: Vec<Work> = order
+        .into_iter()
+        .map(|(field, l)| {
+            let cal_sig = cal_sigs.entry(l.cal).or_insert_with(|| cal_setup_sig(&plan.cals[l.cal])).clone();
+            let sig = light_sig(field, l, &cal_sig, &settings_sig);
+            let up_to_date = light_up_to_date(l, &manifest, &sig);
+            Work { field, l, key: crate::paths::key(&l.registered), sig, cal_sig, up_to_date }
+        })
+        .collect();
+    // Three stages overlap: a reader thread fetches the next raw frame,
+    // this thread calibrates and warps, a writer thread saves the outputs.
+    // A light counts as processed (and goes in the manifest) only once its
+    // files are written.
+    type Read = (usize, Result<(Image, crate::header::Header)>, f64);
+    struct Written {
+        idx: usize,
+        result: Result<()>,
+        seconds: f64,
+    }
+    let timing = crate::timing::on();
+    let (mut t_cal, mut t_warp, mut t_read, mut t_write) = (0f64, 0f64, 0f64, 0f64);
+    std::thread::scope(|scope| -> Result<()> {
+        let (read_tx, read_rx) = std::sync::mpsc::sync_channel::<Read>(1);
+        let todo: Vec<(usize, &Path)> = work.iter().enumerate().filter(|(_, w)| !w.up_to_date).map(|(i, w)| (i, w.l.path.as_path())).collect();
+        scope.spawn(move || {
+            for (i, p) in todo {
+                let t = Instant::now();
+                let r = super::read_with_header(p);
+                if read_tx.send((i, r, t.elapsed().as_secs_f64())).is_err() {
+                    break;
                 }
-                let cal = &mut current.as_mut().unwrap().1;
-                cal.cfa = l.bayer.is_some();
-                let cal = &*cal;
-                let (raw, hdr) = super::read_with_header(&l.path)?;
-                let (img, st) = cal.apply(&raw)?;
-                drop(raw);
-                let mut h = hdr.without_commentary();
-                h.cards.retain(|c| !c.key.starts_with("CRUX-") && c.key != "PEDESTAL");
-                h.push("CRUX-CAL", cal.notes.iter().filter(|n| n.starts_with("dark") || n.starts_with("flat") || n.starts_with("bias")).cloned().collect::<Vec<_>>().join(" — "), "crux calibration");
-                h.push("CRUX-HOT", format!("{}", st.hot_fixed), "Hot pixels replaced");
-                if st.pedestal > 0.0 {
-                    h.push("PEDESTAL", format!("{}", (st.pedestal * raw_scale(&img)).round()), "[DN] Output pedestal added by crux");
+            }
+        });
+        let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<(usize, Vec<(PathBuf, Image, crate::header::Header)>)>(2);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Written>();
+        scope.spawn(move || {
+            for (idx, files) in write_rx {
+                let t = Instant::now();
+                let result = files.iter().try_for_each(|(p, img, h)| write_xisf(p, img, h));
+                if done_tx.send(Written { idx, result, seconds: t.elapsed().as_secs_f64() }).is_err() {
+                    break;
                 }
-                if let Some(c) = &l.calibrated {
-                    write_xisf(c, &img, &h)?;
-                }
-                let inv = l.reg.to_ref.inverse().context("singular registration")?;
-                h.push("CRUX-REF", field.reference_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), "Registration reference");
-                h.push("CRUX-RMS", format!("{:.3}", l.reg.rms), "[px] Registration residual");
-                h.push("CRUX-MAT", l.reg.to_ref.0.iter().map(|v| format!("{v:.10e}")).collect::<Vec<_>>().join(","), "Frame to reference homography");
-                match l.bayer {
-                    None => {
-                        let reg = resample::warp(&img, &inv, img.width, img.height, plan.settings.clamp);
-                        drop(img);
-                        write_xisf(&l.registered, &reg, &h)?;
-                    }
-                    Some(b) => {
-                        // Debayer, then each channel is a mono frame of its
-                        // own "filter": no Bayer keywords any more.
-                        let planes = crate::cfa::debayer(&img, b);
-                        drop(img);
-                        h.cards.retain(|c| !matches!(c.key.as_str(), "BAYERPAT" | "XBAYROFF" | "YBAYROFF" | "COLORTYP" | "CFA-PAT" | "FILTER"));
-                        h.push("CRUX-CFA", b.name(), "Debayered by crux (bilinear) from this pattern");
-                        if let Some(f) = Some(l.filter.clone()).filter(|f| !f.is_empty()) {
-                            h.push("CRUX-OSF", f, "Filter in front of the colour sensor");
-                        }
-                        for (c, p) in planes.iter().enumerate() {
-                            let reg = resample::warp(p, &inv, p.width, p.height, plan.settings.clamp);
-                            let mut hc = h.clone();
-                            hc.push("FILTER", crate::cfa::CHANNELS[c], "Colour channel of a one-shot-colour sensor");
-                            write_xisf(&channel_path(&l.registered, c as u8), &reg, &hc)?;
-                        }
-                    }
-                }
-                Ok(st)
-            })();
-            match r {
-                Ok(st) => {
+            }
+        });
+        let mut compute_secs: HashMap<usize, (f64, CalStats)> = HashMap::new();
+        let mut finished = 0usize;
+        let mut finish = |w: Written, manifest: &mut Manifest, rep: &mut RunReport, done: &mut usize, compute_secs: &mut HashMap<usize, (f64, CalStats)>| {
+            let (secs, st) = compute_secs.remove(&w.idx).unwrap_or_default();
+            let item = &work[w.idx];
+            let mut res = LightResult { seconds: secs + w.seconds, ..Default::default() };
+            match w.result {
+                Ok(()) => {
                     res.cal = st;
-                    manifest.products.insert(key, sig);
+                    manifest.products.insert(item.key.clone(), item.sig.clone());
                     rep.processed += 1;
                 }
                 Err(e) => {
@@ -1132,16 +1128,117 @@ pub fn run_with(plan: &Plan, loaded: &mut Loaded, progress: &(dyn Fn(Event) + Sy
                     rep.failed += 1;
                 }
             }
+            *done += 1;
+            finished += 1;
             // Save as we go, so a crash or cancel keeps finished work.
-            if done % 8 == 0 {
-                let _ = save_manifest(&plan.out, &manifest);
+            if finished % 8 == 0 {
+                let _ = save_manifest(&plan.out, manifest);
             }
-        } else {
-            rep.up_to_date += 1;
+            t_write += w.seconds;
+            progress(Event::Light { done: *done, total, path: item.l.path.clone(), result: res });
+        };
+        let mut pending = Some(write_tx);
+        for (idx, w) in work.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                rep.cancelled = true;
+                break;
+            }
+            while let Ok(wr) = done_rx.try_recv() {
+                finish(wr, &mut manifest, &mut rep, &mut done, &mut compute_secs);
+            }
+            if w.up_to_date {
+                rep.up_to_date += 1;
+                done += 1;
+                progress(Event::Light { done, total, path: w.l.path.clone(), result: LightResult { skipped_up_to_date: true, ..Default::default() } });
+                continue;
+            }
+            let (field, l) = (w.field, w.l);
+            let t1 = Instant::now();
+            let r: Result<(CalStats, Vec<(PathBuf, Image, crate::header::Header)>)> = (|| {
+                let (ri, raw, read_secs) = read_rx.recv().context("the reader stopped")?;
+                debug_assert_eq!(ri, idx);
+                t_read += read_secs;
+                let (raw, hdr) = raw?;
+                if current.as_ref().is_none_or(|c| c.0 != l.cal) {
+                    let c = build_calibrator(plan, l.cal, plan.settings.cal.clone(), &mut manifest, loaded, &mut rep.masters_built, progress)?;
+                    current = Some((l.cal, c, w.cal_sig.clone()));
+                }
+                let tc = Instant::now();
+                let cal = &mut current.as_mut().unwrap().1;
+                cal.cfa = l.bayer.is_some();
+                let cal = &*cal;
+                let (img, st) = cal.apply(&raw)?;
+                drop(raw);
+                t_cal += tc.elapsed().as_secs_f64();
+                let mut files = Vec::new();
+                let mut h = hdr.without_commentary();
+                h.cards.retain(|c| !c.key.starts_with("CRUX-") && c.key != "PEDESTAL");
+                h.push("CRUX-CAL", cal.notes.iter().filter(|n| n.starts_with("dark") || n.starts_with("flat") || n.starts_with("bias")).cloned().collect::<Vec<_>>().join(" — "), "crux calibration");
+                h.push("CRUX-HOT", format!("{}", st.hot_fixed), "Hot pixels replaced");
+                if st.pedestal > 0.0 {
+                    h.push("PEDESTAL", format!("{}", (st.pedestal * raw_scale(&img)).round()), "[DN] Output pedestal added by crux");
+                }
+                let inv = l.reg.to_ref.inverse().context("singular registration")?;
+                let tw = Instant::now();
+                let mut hr = h.clone();
+                hr.push("CRUX-REF", field.reference_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), "Registration reference");
+                hr.push("CRUX-RMS", format!("{:.3}", l.reg.rms), "[px] Registration residual");
+                hr.push("CRUX-MAT", l.reg.to_ref.0.iter().map(|v| format!("{v:.10e}")).collect::<Vec<_>>().join(","), "Frame to reference homography");
+                match l.bayer {
+                    None => {
+                        let reg = resample::warp(&img, &inv, img.width, img.height, plan.settings.clamp);
+                        files.push((l.registered.clone(), reg, hr));
+                    }
+                    Some(b) => {
+                        // Debayer, then each channel is a mono frame of its
+                        // own "filter": no Bayer keywords any more.
+                        let planes = crate::cfa::debayer(&img, b);
+                        hr.cards.retain(|c| !matches!(c.key.as_str(), "BAYERPAT" | "XBAYROFF" | "YBAYROFF" | "COLORTYP" | "CFA-PAT" | "FILTER"));
+                        hr.push("CRUX-CFA", b.name(), "Debayered by crux (bilinear) from this pattern");
+                        if let Some(f) = Some(l.filter.clone()).filter(|f| !f.is_empty()) {
+                            hr.push("CRUX-OSF", f, "Filter in front of the colour sensor");
+                        }
+                        for (c, p) in planes.iter().enumerate() {
+                            let reg = resample::warp(p, &inv, p.width, p.height, plan.settings.clamp);
+                            let mut hc = hr.clone();
+                            hc.push("FILTER", crate::cfa::CHANNELS[c], "Colour channel of a one-shot-colour sensor");
+                            files.push((channel_path(&l.registered, c as u8), reg, hc));
+                        }
+                    }
+                }
+                t_warp += tw.elapsed().as_secs_f64();
+                if let Some(c) = &l.calibrated {
+                    files.push((c.clone(), img, h));
+                }
+                Ok((st, files))
+            })();
+            match r {
+                Ok((st, files)) => {
+                    compute_secs.insert(idx, (t1.elapsed().as_secs_f64(), st));
+                    if let Some(tx) = &pending {
+                        if tx.send((idx, files)).is_err() {
+                            anyhow::bail!("the writer stopped");
+                        }
+                    }
+                }
+                Err(e) => {
+                    rep.failed += 1;
+                    done += 1;
+                    let res = LightResult { error: Some(format!("{e:#}")), seconds: t1.elapsed().as_secs_f64(), ..Default::default() };
+                    progress(Event::Light { done, total, path: l.path.clone(), result: res });
+                }
+            }
         }
-        done += 1;
-        res.seconds = t1.elapsed().as_secs_f64();
-        progress(Event::Light { done, total, path: l.path.clone(), result: res });
+        // Let the reader stop, then wait for the last writes.
+        drop(read_rx);
+        pending.take();
+        for wr in done_rx {
+            finish(wr, &mut manifest, &mut rep, &mut done, &mut compute_secs);
+        }
+        Ok(())
+    })?;
+    if timing {
+        eprintln!("process: read {t_read:.1} s, calibrate {t_cal:.1} s, warp {t_warp:.1} s, write {t_write:.1} s (overlapping), lights done at {:.1} s", t0.elapsed().as_secs_f64());
     }
     // Earlier versions wrote the plan here too; nothing read it.
     let _ = std::fs::remove_file(plan.out.join("crux-plan.json"));

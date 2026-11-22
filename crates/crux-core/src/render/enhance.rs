@@ -224,15 +224,11 @@ fn crux_engine(master: &Path, dir: &Path, ch: &str, mh: &str, s: &EnhanceSetting
     {
         use super::net::{Kind, Network, Settings};
         use rayon::prelude::*;
+        let laps = crate::timing::Laps::new(format!("enhance {ch}"));
         let (orig, hdr) = crate::process::read_with_header(master)?;
-        let noise = crate::process::combine::noise_of(&orig).max(1e-6);
-        let sky = {
-            let mut v: Vec<f32> = orig.data.iter().step_by(11).copied().filter(|v| *v > 0.0).collect();
-            crate::stats::median_mut(&mut v)
-        };
-        let mut cfg = crate::config::Config::default();
-        cfg.analysis.trails = false;
-        let fwhm = crate::analysis::analyze_light(&orig, &cfg).fwhm.unwrap_or(3.0);
+        laps.lap("read");
+        let (noise, sky, fwhm) = super::net::measure(&orig);
+        laps.lap(&format!("noise, sky and FWHM ({fwhm:.2} px)"));
         let cached = |kind: Kind, control: f32, step: &str| -> Result<Image> {
             let (_, _, tag) = super::net::builtin(kind).ok_or_else(|| anyhow::anyhow!("this build of crux has no {} network", kind.format()))?;
             let file = dir.join(format!("{ch}_{mh}_{step}-{tag}.xisf"));
@@ -242,9 +238,11 @@ fn crux_engine(master: &Path, dir: &Path, ch: &str, mh: &str, s: &EnhanceSetting
                 }
             }
             p(step, 0.0);
-            let net = Network::builtin(kind, 512)?;
+            let net = Network::shared(kind)?;
             let out = net.run(&orig, noise, sky, fwhm, &[control], &Settings::default(), &|k, n| p(step, k as f32 / n.max(1) as f32), cancel)?;
+            laps.lap(&format!("{step} on the {}", net.engine()));
             write(&file, &out, &Header::default())?;
+            laps.lap(&format!("{step} written"));
             Ok(out)
         };
         let d = cached(Kind::Denoise, 0.0, "denoise")?;
@@ -275,7 +273,9 @@ fn crux_engine(master: &Path, dir: &Path, ch: &str, mh: &str, s: &EnhanceSetting
         img.adu_scale = orig.adu_scale;
         let mut h = hdr;
         h.push("HISTORY", "", &format!("crux enhance: {}", s.describe()));
+        laps.lap("blend");
         write(fin, &img, &h)?;
+        laps.lap("final written");
         p("blend", 1.0);
         Ok(())
     }

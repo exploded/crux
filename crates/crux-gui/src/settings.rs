@@ -109,6 +109,7 @@ pub fn show(ui: &mut Ui, a: &mut UiState, s: Option<&mut Session>) {
         if w::button_enabled(ui, &p, "Save", Kind::Primary, None, can).clicked() {
             match d.save_user() {
                 Ok(path) => {
+                    crux_core::gpu::set_enabled(d.gpu.r#use == crux_core::config::GpuUse::Auto);
                     let old = std::mem::replace(&mut st.saved, d.clone());
                     st.file = Some(path);
                     st.error = None;
@@ -315,6 +316,20 @@ fn processing(ui: &mut Ui, p: &Pal, st: &mut SettingsUi, d: &mut Config, def: &C
                 &[("auto", "Auto (by stack size)"), ("esd", "ESD"), ("winsorized", "Winsorised sigma"), ("sigma", "Sigma"), ("percentile", "Percentile"), ("none", "None")],
             );
             check(ui, p, "Mosaic after integrating", "Assemble mosaics of panel targets after the stacking steps or Autopilot integrate them.", &mut d.mosaic.after_integrate, def.mosaic.after_integrate);
+            let mut on = d.gpu.r#use == crux_core::config::GpuUse::Auto;
+            check(
+                ui,
+                p,
+                "Use the graphics card",
+                "Run Sharpen and denoise, the star remover and other heavy steps on the graphics card when crux finds one (NVIDIA, AMD, Intel or Apple). Off: always the CPU, which is much slower but gives the same result.",
+                &mut on,
+                true,
+            );
+            d.gpu.r#use = if on { crux_core::config::GpuUse::Auto } else { crux_core::config::GpuUse::Off };
+            ui.label("");
+            w::muted(ui, p, &format!("Now computing on: {}", crux_core::gpu::describe()));
+            ui.label("");
+            ui.end_row();
         });
     });
 }

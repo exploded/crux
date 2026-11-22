@@ -907,6 +907,7 @@ fn run() -> Result<()> {
                 Some(p) => println!("# loaded from {}", p.display()),
                 None => println!("# defaults (no crux.toml found)"),
             }
+            println!("# computing on: {}", crux_core::gpu::describe());
             print!("{}", cfg.to_toml());
         }
     }
@@ -1889,7 +1890,7 @@ fn image(cli: &Cli, dir: &Path, workspace: Option<&Path>, object: Option<&str>, 
                 let _ = std::io::stderr().flush();
             }, &cancel)?;
             eprintln!("\r{:72}", "");
-            println!("  enhanced: {} in {:.1} s", r.enhance.describe(), te.elapsed().as_secs_f64());
+            println!("  enhanced: {} in {:.1} s (on {})", r.enhance.describe(), te.elapsed().as_secs_f64(), crux_core::gpu::describe());
             &enhanced
         } else {
             t
@@ -1903,7 +1904,7 @@ fn image(cli: &Cli, dir: &Path, workspace: Option<&Path>, object: Option<&str>, 
                 let _ = std::io::stderr().flush();
             }, &cancel)?;
             eprintln!("\r{:72}", "");
-            println!("  stars removed by the network in {:.1} s", ts.elapsed().as_secs_f64());
+            println!("  stars removed by the network in {:.1} s (on {})", ts.elapsed().as_secs_f64(), crux_core::gpu::describe());
             &with_sl
         } else {
             t

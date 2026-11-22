@@ -46,7 +46,6 @@ pub fn apply(t: &Target, out: &Path, progress: &(dyn Fn(usize, usize, f32) + Syn
         let mut res = t.clone();
         let n = t.masters.len();
         let mut keep = Vec::new();
-        let mut net: Option<Network> = None;
         for (i, m) in t.masters.iter().enumerate() {
             let (size, mtime) = std::fs::metadata(&m.path)
                 .map(|md| (md.len(), md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos()).unwrap_or(0)))
@@ -54,22 +53,17 @@ pub fn apply(t: &Target, out: &Path, progress: &(dyn Fn(usize, usize, f32) + Syn
             let mh = hex(&format!("{}:{size}:{mtime}", crate::paths::key(&m.path)));
             let file = dir.join(format!("{}_{mh}_{tag}.xisf", crate::process::job::safe_name(&m.channel)));
             if !file.is_file() {
+                let laps = crate::timing::Laps::new(format!("starless {}", m.channel));
                 let img = crate::read_image(&m.path)?;
-                let noise = crate::process::combine::noise_of(&img).max(1e-6);
-                let sky = {
-                    let mut v: Vec<f32> = img.data.iter().step_by(11).copied().filter(|v| *v > 0.0).collect();
-                    crate::stats::median_mut(&mut v)
-                };
-                let mut cfg = crate::config::Config::default();
-                cfg.analysis.trails = false;
-                let fwhm = crate::analysis::analyze_light(&img, &cfg).fwhm.unwrap_or(3.0);
-                if net.is_none() {
-                    net = Some(Network::builtin(Kind::Starless, 512)?);
-                }
-                let sl = net.as_ref().unwrap().run(&img, noise, sky, fwhm, &[], &Settings::default(), &|k, nn| progress(i, n, k as f32 / nn.max(1) as f32), cancel)?;
+                laps.lap("read");
+                let (noise, sky, fwhm) = super::net::measure(&img);
+                laps.lap(&format!("noise, sky and FWHM ({fwhm:.2} px)"));
+                let net = Network::shared(Kind::Starless)?;
+                let sl = net.run(&img, noise, sky, fwhm, &[], &Settings::default(), &|k, nn| progress(i, n, k as f32 / nn.max(1) as f32), cancel)?;
                 let tmp = super::enhance::tmp_path(&file);
                 crate::xisf::write_image(&tmp, &sl, &crate::header::Header::default(), None)?;
                 std::fs::rename(&tmp, &file)?;
+                laps.lap("network and write");
             }
             keep.push(file.clone());
             res.masters[i].starless = Some(file);

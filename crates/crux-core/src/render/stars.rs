@@ -183,20 +183,18 @@ pub fn detect(img: &Image, s: &StarSettings) -> Vec<Disc> {
     for step in [1usize, 2, 4] {
         c = b3(&c, w, h, step);
     }
-    let detail: Vec<f32> = img.data.iter().zip(&c).map(|(v, s)| if *v == 0.0 { 0.0 } else { v - s }).collect();
-    // Noise of the detail layer: MAD of a sample.
+    let detail: Vec<f32> = img.data.par_iter().zip(c.par_iter()).map(|(v, s)| if *v == 0.0 { 0.0 } else { v - s }).collect();
+    drop(c);
+    // Noise of the detail layer: MAD of a sample (exact selections, in
+    // parallel on big images).
     let mut smp: Vec<f32> = detail.iter().step_by(7).copied().filter(|v| *v != 0.0).collect();
     if smp.is_empty() {
         return Vec::new();
     }
     let m = smp.len() / 2;
-    smp.select_nth_unstable_by(m, |a, b| a.total_cmp(b));
-    let med = smp[m];
-    for v in smp.iter_mut() {
-        *v = (*v - med).abs();
-    }
-    smp.select_nth_unstable_by(m, |a, b| a.total_cmp(b));
-    let sigma = (1.4826 * smp[m]).max(1e-9);
+    let med = crate::stats::kth_par(&smp, m);
+    smp.par_iter_mut().for_each(|v| *v = (*v - med).abs());
+    let sigma = (1.4826 * crate::stats::kth_par(&smp, m)).max(1e-9);
     let thr = med + s.sigma as f32 * sigma;
     // Connected components above the threshold (8-connected).
     let mut seen = vec![false; w * h];
@@ -350,56 +348,124 @@ pub struct Paint {
     pub confidence: Vec<f32>,
 }
 
-pub fn paint(stars: &[StarInfo], n: usize, width: usize, height: usize, scale: f32, x0: f32, y0: f32) -> Paint {
-    let mut flux = vec![vec![0f32; width * height]; n];
-    let mut conf = vec![0f32; width * height];
-    let mut best = vec![0f32; width * height];
-    for s in stars {
-        let (cx, cy, r) = ((s.disc.x - x0) * scale, (s.disc.y - y0) * scale, (s.disc.r * scale).max(0.75) + 1.5 * scale.min(1.0));
-        if cx + r < 0.0 || cy + r < 0.0 || cx - r >= width as f32 || cy - r >= height as f32 {
-            continue;
-        }
-        let key = s.flux.iter().copied().fold(0f32, f32::max);
-        let (xa, xb) = ((cx - r).floor().max(0.0) as usize, ((cx + r).ceil() as usize).min(width - 1));
-        let (ya, yb) = ((cy - r).floor().max(0.0) as usize, ((cy + r).ceil() as usize).min(height - 1));
-        for y in ya..=yb {
-            for x in xa..=xb {
-                if (x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2) > r * r {
-                    continue;
-                }
-                let i = y * width + x;
-                // Overlaps: the brighter star wins.
-                if key > best[i] {
-                    best[i] = key;
-                    for k in 0..n {
-                        flux[k][i] = s.flux[k];
-                    }
-                    conf[i] = s.confidence;
-                }
+/// Rows per band when painting discs in parallel.
+const BAND: usize = 64;
+
+/// For each band of `BAND` rows, the items (in their original order) whose
+/// rows `ya..=yb` touch it. Painting band by band in that order gives
+/// every pixel exactly what painting item by item gives.
+fn bands(spans: &[Option<(usize, usize)>], height: usize) -> Vec<Vec<u32>> {
+    let mut b = vec![Vec::new(); height.div_ceil(BAND).max(1)];
+    for (i, s) in spans.iter().enumerate() {
+        if let Some((ya, yb)) = s {
+            for band in b.iter_mut().take(yb / BAND + 1).skip(ya / BAND) {
+                band.push(i as u32);
             }
         }
     }
+    b
+}
+
+pub fn paint(stars: &[StarInfo], n: usize, width: usize, height: usize, scale: f32, x0: f32, y0: f32) -> Paint {
+    let mut flux = vec![vec![0f32; width * height]; n];
+    let mut conf = vec![0f32; width * height];
+    if width == 0 || height == 0 {
+        return Paint { flux, confidence: conf };
+    }
+    struct Spot {
+        cx: f32,
+        cy: f32,
+        r: f32,
+        key: f32,
+        xa: usize,
+        xb: usize,
+    }
+    let spots: Vec<Option<(Spot, usize, usize)>> = stars
+        .iter()
+        .map(|s| {
+            let (cx, cy, r) = ((s.disc.x - x0) * scale, (s.disc.y - y0) * scale, (s.disc.r * scale).max(0.75) + 1.5 * scale.min(1.0));
+            if cx + r < 0.0 || cy + r < 0.0 || cx - r >= width as f32 || cy - r >= height as f32 {
+                return None;
+            }
+            let key = s.flux.iter().copied().fold(0f32, f32::max);
+            let (xa, xb) = ((cx - r).floor().max(0.0) as usize, ((cx + r).ceil() as usize).min(width - 1));
+            let (ya, yb) = ((cy - r).floor().max(0.0) as usize, ((cy + r).ceil() as usize).min(height - 1));
+            Some((Spot { cx, cy, r, key, xa, xb }, ya, yb))
+        })
+        .collect();
+    let lists = bands(&spots.iter().map(|s| s.as_ref().map(|(_, a, b)| (*a, *b))).collect::<Vec<_>>(), height);
+    // Every plane cut into the same bands.
+    let mut flux_bands: Vec<Vec<&mut [f32]>> = (0..lists.len()).map(|_| Vec::with_capacity(n)).collect();
+    for plane in flux.iter_mut() {
+        for (k, c) in plane.chunks_mut(BAND * width).enumerate() {
+            flux_bands[k].push(c);
+        }
+    }
+    conf.par_chunks_mut(BAND * width).zip(flux_bands.into_par_iter()).zip(lists.par_iter()).enumerate().for_each(|(band, ((conf, mut fl), list))| {
+        let row0 = band * BAND;
+        let rows = conf.len() / width;
+        let mut best = vec![0f32; conf.len()];
+        for &si in list {
+            let Some((sp, ya, yb)) = &spots[si as usize] else { continue };
+            let s = &stars[si as usize];
+            for y in (*ya).max(row0)..=(*yb).min(row0 + rows - 1) {
+                for x in sp.xa..=sp.xb {
+                    if (x as f32 + 0.5 - sp.cx).powi(2) + (y as f32 + 0.5 - sp.cy).powi(2) > sp.r * sp.r {
+                        continue;
+                    }
+                    let i = (y - row0) * width + x;
+                    // Overlaps: the brighter star wins.
+                    if sp.key > best[i] {
+                        best[i] = sp.key;
+                        for (k, f) in fl.iter_mut().enumerate() {
+                            f[i] = s.flux[k];
+                        }
+                        conf[i] = s.confidence;
+                    }
+                }
+            }
+        }
+    });
     Paint { flux, confidence: conf }
 }
 
 /// A soft mask (1 inside a disc, fading over 1.5 px) from discs.
 pub fn mask(discs: &[Disc], w: usize, h: usize) -> Vec<f32> {
     let mut m = vec![0f32; w * h];
-    for d in discs {
-        let ext = d.r + 1.5;
-        let (xa, xb) = ((d.x - ext).floor().max(0.0) as usize, ((d.x + ext).ceil() as usize).min(w.saturating_sub(1)));
-        let (ya, yb) = ((d.y - ext).floor().max(0.0) as usize, ((d.y + ext).ceil() as usize).min(h.saturating_sub(1)));
-        for y in ya..=yb {
-            for x in xa..=xb {
-                let dist = ((x as f32 - d.x).powi(2) + (y as f32 - d.y).powi(2)).sqrt();
-                let v = ((ext - dist) / 1.5).clamp(0.0, 1.0);
-                let i = y * w + x;
-                if v > m[i] {
-                    m[i] = v;
+    if w == 0 || h == 0 {
+        return m;
+    }
+    let spans: Vec<Option<(usize, usize)>> = discs
+        .iter()
+        .map(|d| {
+            let ext = d.r + 1.5;
+            Some(((d.y - ext).floor().max(0.0) as usize, ((d.y + ext).ceil() as usize).min(h.saturating_sub(1))))
+        })
+        .collect();
+    let lists = bands(&spans, h);
+    m.par_chunks_mut(BAND * w).zip(lists.par_iter()).enumerate().for_each(|(band, (m, list))| {
+        let row0 = band * BAND;
+        let rows = m.len() / w;
+        for &di in list {
+            let d = &discs[di as usize];
+            let ext = d.r + 1.5;
+            let (xa, xb) = ((d.x - ext).floor().max(0.0) as usize, ((d.x + ext).ceil() as usize).min(w.saturating_sub(1)));
+            let (ya, yb) = spans[di as usize].unwrap();
+            if yb < row0 || ya >= row0 + rows {
+                continue;
+            }
+            for y in ya.max(row0)..=yb.min(row0 + rows - 1) {
+                for x in xa..=xb {
+                    let dist = ((x as f32 - d.x).powi(2) + (y as f32 - d.y).powi(2)).sqrt();
+                    let v = ((ext - dist) / 1.5).clamp(0.0, 1.0);
+                    let i = (y - row0) * w + x;
+                    if v > m[i] {
+                        m[i] = v;
+                    }
                 }
             }
         }
-    }
+    });
     m
 }
 

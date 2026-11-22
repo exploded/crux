@@ -871,6 +871,7 @@ name = "crux-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "chrono",
  "chrono-tz",
  "dirs",
@@ -878,6 +879,7 @@ dependencies = [
  "image",
  "lz4_flex",
  "png 0.17.16",
+ "pollster",
  "rayon",
  "roxmltree",
  "rusqlite",
@@ -888,6 +890,7 @@ dependencies = [
  "toml 0.8.23",
  "tract-onnx",
  "walkdir",
+ "wgpu",
 ]
 
 [[package]]

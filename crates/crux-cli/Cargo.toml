@@ -21,6 +21,7 @@ chrono.workspace = true
 png = "0.17"
 
 [features]
-default = ["sqlite", "ml"]
+default = ["sqlite", "ml", "gpu"]
 sqlite = ["crux-core/sqlite"]
 ml = ["crux-core/ml"]
+gpu = ["crux-core/gpu"]

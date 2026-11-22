@@ -100,6 +100,35 @@ fn lanczos_lut() -> &'static [f32] {
     })
 }
 
+/// The kernel table, for the GPU's copy.
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+pub(crate) fn lanczos_table() -> &'static [f32] {
+    lanczos_lut()
+}
+
+/// Warps smaller than this stay on the CPU (uploading costs more than it
+/// saves).
+#[cfg(feature = "gpu")]
+const GPU_MIN_PIXELS: usize = 1 << 20;
+
+/// The warp on the GPU when there is one and the job is big enough; `None`
+/// means do it on the CPU (a GPU failure also switches the GPU off).
+#[cfg(feature = "gpu")]
+fn on_gpu(src: &Image, w: usize, h: usize, step: usize, map: &(dyn Fn(f64, f64) -> Option<(f64, f64)> + Sync), nan_outside: bool, clamp: Option<f32>) -> Option<Vec<f32>> {
+    if w * h < GPU_MIN_PIXELS {
+        return None;
+    }
+    let gpu = crate::gpu::get()?;
+    let (gw, nodes) = crate::gpu::warp::grid(w, h, step, map);
+    match crate::gpu::warp::run(gpu, src, w, h, step, gw, &nodes, nan_outside, clamp) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::gpu::fail(&format!("warp: {e:#}"));
+            None
+        }
+    }
+}
+
 #[inline]
 fn lw(lut: &[f32], d: f32) -> f32 {
     let a = d.abs() * LUT_RES as f32;
@@ -163,6 +192,19 @@ pub fn warp_bilinear(src: &Image, out_to_src: &Homography, w: usize, h: usize) -
 /// source pixels. Pixels mapped outside the source's pixel centres become
 /// 0 (no data), as in StarAlignment.
 pub fn warp(src: &Image, out_to_src: &Homography, w: usize, h: usize, clamp: Option<f32>) -> Image {
+    // On the GPU the homography is evaluated in f64 every 8 px and
+    // interpolated: its perspective terms bend it by ~1e-6 px over that.
+    #[cfg(feature = "gpu")]
+    if let Some(v) = on_gpu(src, w, h, 8, &|x, y| Some(out_to_src.apply(x, y)), false, clamp) {
+        let mut img = Image::from_data(w, h, v);
+        img.adu_scale = src.adu_scale;
+        return img;
+    }
+    warp_cpu(src, out_to_src, w, h, clamp)
+}
+
+/// `warp` on the CPU.
+pub fn warp_cpu(src: &Image, out_to_src: &Homography, w: usize, h: usize, clamp: Option<f32>) -> Image {
     let lut = lanczos_lut();
     let (sw, sh) = (src.width as i64, src.height as i64);
     let mut out = vec![0f32; w * h];
@@ -205,6 +247,15 @@ pub fn warp(src: &Image, out_to_src: &Homography, w: usize, h: usize, clamp: Opt
 /// distortion bend by far less than a pixel over 16 px). Output pixels
 /// whose nearest four source pixels aren't all non-zero are NaN.
 pub fn warp_with(src: &Image, w: usize, h: usize, step: usize, map: &(dyn Fn(f64, f64) -> Option<(f64, f64)> + Sync)) -> Vec<f32> {
+    #[cfg(feature = "gpu")]
+    if let Some(v) = on_gpu(src, w, h, step.max(1), map, true, None) {
+        return v;
+    }
+    warp_with_cpu(src, w, h, step, map)
+}
+
+/// `warp_with` on the CPU.
+pub fn warp_with_cpu(src: &Image, w: usize, h: usize, step: usize, map: &(dyn Fn(f64, f64) -> Option<(f64, f64)> + Sync)) -> Vec<f32> {
     let lut = lanczos_lut();
     let step = step.max(1);
     let (gw, gh) = (w.div_ceil(step) + 1, h.div_ceil(step) + 1);
@@ -266,6 +317,67 @@ mod tests {
         for (a, b) in id.0.iter().zip(Homography::identity().0) {
             assert!((a - b).abs() < 1e-9);
         }
+    }
+
+    /// A star field with an empty corner, warped both ways on the GPU and
+    /// the CPU: same pixels.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_warps_match_the_cpu() {
+        let Some(gpu) = crate::gpu::get() else {
+            eprintln!("no GPU here: skipped");
+            return;
+        };
+        let (w, h) = (900usize, 640usize);
+        let mut data: Vec<f32> = (0..w * h).map(|i| 0.02 + 0.01 * ((i % w) as f32 * 0.05).sin() * ((i / w) as f32 * 0.03).cos()).collect();
+        for k in 0..400 {
+            let (sx, sy) = ((k * 7919 % w) as f32, (k * 104729 % h) as f32);
+            let a = 0.05 + (k % 13) as f32 * 0.07;
+            for y in (sy as usize).saturating_sub(6)..(sy as usize + 7).min(h) {
+                for x in (sx as usize).saturating_sub(6)..(sx as usize + 7).min(w) {
+                    data[y * w + x] += a * (-((x as f32 - sx).powi(2) + (y as f32 - sy).powi(2)) / 3.2).exp();
+                }
+            }
+        }
+        for y in 0..80 {
+            for x in 0..120 {
+                data[y * w + x] = 0.0;
+            }
+        }
+        let src = Image::from_data(w, h, data);
+        let hm = Homography([0.9993, 0.0371, 12.37, -0.0369, 1.0004, -7.81, 2e-7, -1e-7, 1.0]);
+        for clamp in [None, Some(0.15)] {
+            let (gw, nodes) = crate::gpu::warp::grid(w, h, 8, &|x, y| Some(hm.apply(x, y)));
+            let g = crate::gpu::warp::run(gpu, &src, w, h, 8, gw, &nodes, false, clamp).unwrap().unwrap();
+            let c = warp_cpu(&src, &hm, w, h, clamp);
+            let worst = g.iter().zip(&c.data).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            // Clamping switches at a threshold: a pixel right on it can go
+            // either way after rounding.
+            let off = g.iter().zip(&c.data).filter(|(a, b)| (*a - *b).abs() > 1e-5).count();
+            match clamp {
+                None => assert!(worst < 1e-5, "homography: {worst:e}"),
+                Some(_) => assert!(off * 10_000 <= w * h && worst < 1e-3, "homography, clamped: {off} pixels differ, by up to {worst:e}"),
+            }
+        }
+        // A bent mapping with a hole and far-off coordinates.
+        let map = |x: f64, y: f64| -> Option<(f64, f64)> {
+            if x > 700.0 && y > 500.0 {
+                return None;
+            }
+            Some((x * 0.98 + 0.00002 * y * y + 3.3, y * 1.01 - 0.00003 * x * x + 1.7))
+        };
+        let (gw, nodes) = crate::gpu::warp::grid(w, h, 16, &map);
+        let g = crate::gpu::warp::run(gpu, &src, w, h, 16, gw, &nodes, true, None).unwrap().unwrap();
+        let c = warp_with_cpu(&src, w, h, 16, &map);
+        let mut worst = 0f32;
+        for (a, b) in g.iter().zip(&c) {
+            assert_eq!(a.is_nan(), b.is_nan());
+            if !a.is_nan() {
+                worst = worst.max((a - b).abs());
+            }
+        }
+        assert!(worst < 1e-5, "mapping: {worst:e}");
+        assert!(c.iter().filter(|v| v.is_nan()).count() > 10_000);
     }
 
     #[test]

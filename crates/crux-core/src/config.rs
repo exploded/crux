@@ -22,6 +22,8 @@ pub struct Config {
     pub cache: CacheSettings,
     /// Mosaic assembly (milestone 14).
     pub mosaic: crate::process::mosaic::Settings,
+    /// The graphics card.
+    pub gpu: GpuSettings,
 }
 
 impl Default for Config {
@@ -38,8 +40,26 @@ impl Default for Config {
             thresholds: Thresholds::default(),
             cache: CacheSettings::default(),
             mosaic: Default::default(),
+            gpu: GpuSettings::default(),
         }
     }
+}
+
+/// Whether crux computes on the graphics card (see `gpu`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum GpuUse {
+    /// When crux finds a suitable card; the CPU otherwise.
+    #[default]
+    Auto,
+    /// Always the CPU.
+    Off,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct GpuSettings {
+    pub r#use: GpuUse,
 }
 
 /// Where each folder's cache lives and when it's cleaned (see `cachedir`).
@@ -644,12 +664,14 @@ impl Config {
             if p.is_file() {
                 let text = std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
                 let cfg: Config = toml::from_str(&text).with_context(|| format!("parse {}", p.display()))?;
+                crate::gpu::set_enabled(cfg.gpu.r#use == GpuUse::Auto);
                 return Ok((cfg, Some(p)));
             }
             if explicit.is_some() {
                 anyhow::bail!("config file {} not found", p.display());
             }
         }
+        crate::gpu::set_enabled(true);
         Ok((Config::default(), None))
     }
 

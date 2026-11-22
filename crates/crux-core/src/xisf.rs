@@ -370,16 +370,15 @@ pub fn write_planes(path: &Path, width: usize, height: usize, planes: &[&[f32]],
 fn write_with(path: &Path, width: usize, height: usize, planes: &[&[f32]], extra: &Header, props: &[(&str, &str)], codec: Option<&str>) -> Result<()> {
     let nch = planes.len();
     anyhow::ensure!(nch == 1 || nch == 3, "XISF writer: 1 or 3 channels, not {nch}");
-    let mut raw = Vec::with_capacity(width * height * nch * 4);
     for p in planes {
         anyhow::ensure!(p.len() == width * height, "XISF writer: plane size");
-        for v in p.iter() {
-            raw.extend_from_slice(&v.to_le_bytes());
-        }
     }
+    // Uncompressed planes go to the file straight from memory.
+    let raw_len = width * height * nch * 4;
     let (block, comp_attr) = match codec {
-        None => (raw, String::new()),
+        None => (None, String::new()),
         Some(c) => {
+            let raw: Vec<u8> = planes.iter().flat_map(|p| le_bytes(p).into_owned()).collect();
             let sh = shuffle(&raw, 4);
             let comp = match c {
                 "zlib" => {
@@ -390,9 +389,10 @@ fn write_with(path: &Path, width: usize, height: usize, planes: &[&[f32]], extra
                 "lz4" => lz4_flex::block::compress(&sh),
                 o => bail!("unsupported codec {o}"),
             };
-            (comp, format!(" compression=\"{c}+sh:{}:4\"", raw.len()))
+            (Some(comp), format!(" compression=\"{c}+sh:{}:4\"", raw.len()))
         }
     };
+    let block_len = block.as_ref().map(|b| b.len()).unwrap_or(raw_len);
     let esc = |s: &str| s.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;").replace('>', "&gt;");
     let mut kws = String::new();
     for c in &extra.cards {
@@ -413,7 +413,7 @@ fn write_with(path: &Path, width: usize, height: usize, planes: &[&[f32]], extra
     let build = |offset: usize| {
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?><xisf version=\"1.0\" xmlns=\"http://www.pixinsight.com/xisf\"><Image geometry=\"{}:{}:{}\" sampleFormat=\"Float32\" bounds=\"0:1\" colorSpace=\"{}\" location=\"attachment:{}:{}\"{}>{}</Image></xisf>",
-            width, height, nch, space, offset, block.len(), comp_attr, kws
+            width, height, nch, space, offset, block_len, comp_attr, kws
         )
     };
     let probe = build(0).len() + 64;
@@ -425,9 +425,31 @@ fn write_with(path: &Path, width: usize, height: usize, planes: &[&[f32]], extra
     f.write_all(&(xml.len() as u32).to_le_bytes())?;
     f.write_all(&[0u8; 4])?;
     f.write_all(&xml)?;
-    f.write_all(&block)?;
+    match &block {
+        Some(b) => f.write_all(b)?,
+        None => {
+            for p in planes {
+                f.write_all(&le_bytes(p))?;
+            }
+        }
+    }
     f.flush()?;
     Ok(())
+}
+
+/// Little-endian bytes of `v`: borrowed as they are on little-endian
+/// machines (every platform crux builds for), copied elsewhere.
+fn le_bytes(v: &[f32]) -> std::borrow::Cow<'_, [u8]> {
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: f32 has no padding and any byte pattern is a valid u8;
+        // the length covers exactly the slice's memory.
+        std::borrow::Cow::Borrowed(unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) })
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        std::borrow::Cow::Owned(v.iter().flat_map(|x| x.to_le_bytes()).collect())
+    }
 }
 
 #[cfg(test)]

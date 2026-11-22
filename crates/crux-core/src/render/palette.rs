@@ -78,18 +78,16 @@ pub struct Stats {
 impl Stats {
     /// `full`: every pixel of the channel; `proxy`: its preview copy.
     pub fn measure(full: &[f32], proxy: &[f32]) -> Stats {
-        let mut v: Vec<f32> = full.iter().copied().filter(|x| *x > ZERO_FLOOR && x.is_finite()).collect();
-        let (median, mad) = if v.is_empty() {
+        use rayon::prelude::*;
+        // Exact selections over the pixels with data, in parallel and
+        // without copying them (the same values select_nth gives).
+        let keep = |x: f32| x > ZERO_FLOOR && x.is_finite();
+        let n = full.par_iter().filter(|x| keep(**x)).count();
+        let (median, mad) = if n == 0 {
             (0.0, 0.0)
         } else {
-            let m = v.len() / 2;
-            v.select_nth_unstable_by(m, |a, b| a.total_cmp(b));
-            let med = v[m];
-            for x in v.iter_mut() {
-                *x = (*x - med).abs();
-            }
-            v.select_nth_unstable_by(m, |a, b| a.total_cmp(b));
-            (med as f64, v[m] as f64)
+            let med = crate::stats::kth_par_by(full, n / 2, |x| keep(x).then_some(x));
+            (med as f64, crate::stats::kth_par_by(full, n / 2, |x| keep(x).then(|| (x - med).abs())) as f64)
         };
         let mut all: Vec<f32> = proxy.iter().copied().filter(|x| x.is_finite()).collect();
         all.sort_by(|a, b| a.total_cmp(b));

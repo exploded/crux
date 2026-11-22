@@ -68,11 +68,18 @@ The binaries are in `target\release`.
 
 ### Features
 
-Both features are on by default:
+All three features are on by default:
 
 - `ml`: crux's neural networks (denoising, star correction and star
   removal), compiled into the binaries from `crates/crux-core/models/`. They
-  run on the CPU with [tract](https://github.com/sonos/tract).
+  run with [tract](https://github.com/sonos/tract) on the CPU, or on the
+  graphics card with `gpu`.
+- `gpu`: the networks and the registration warps on the graphics card,
+  through [wgpu](https://wgpu.rs): DirectX 12 or Vulkan on Windows, Vulkan
+  on Linux, Metal on macOS, for NVIDIA, AMD, Intel and Apple GPUs. No vendor
+  libraries are needed. When there's no suitable card, or it fails, crux uses
+  the CPU and gets the same result. On an RTX 3070 the networks run about
+  15× faster than on an 8-core CPU.
 - `sqlite`: the library index and flat library, in SQLite (bundled, so it
   needs a C compiler). Without it, the index falls back to JSON and there's
   no flat library.
@@ -112,6 +119,9 @@ latitude = -37.81
 longitude = 144.96
 timezone = "Australia/Melbourne"
 ```
+
+To always compute on the CPU, set `use = "off"` under `[gpu]` (or the
+environment variable `CRUX_GPU=off`).
 
 ## Acknowledgements
 
