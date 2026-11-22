@@ -63,6 +63,12 @@ pub struct ImageUi {
     save_name: String,
     saved: Option<Vec<(String, PathBuf)>>,
     pub split: f32,
+    /// Pinned layout: the preview's height limit this frame, and the share
+    /// of the column it gets (dragged with the handle under it).
+    pin_h: Option<f32>,
+    view_frac: f32,
+    /// Palette stage: whether the preset pictures are shown.
+    tiles_open: bool,
     cancel: Arc<AtomicBool>,
     /// Set by the screenshot harness.
     pub pending_preset: Option<String>,
@@ -93,6 +99,27 @@ pub struct ImageUi {
     enh_avail: Option<[(Result<(), String>, Result<(), String>); 2]>,
     /// Harness: steps to switch on ("denoise", "correct", "tighten").
     pub pending_enhance: Vec<&'static str>,
+}
+
+impl ImageUi {
+    /// Harness: the preview's share of the column (`img-view:<f>`).
+    pub fn set_view_frac(&mut self, f: f32) {
+        self.view_frac = f.clamp(0.15, 0.85);
+    }
+
+    /// Harness: fold the preset pictures away (`img-fold`).
+    pub fn fold_presets(&mut self) {
+        self.tiles_open = false;
+    }
+}
+
+/// Pinned layout: the share of the column the preview starts with.
+const VIEW_FRAC: f32 = 0.6;
+
+/// The preview's height limit: the pinned layout's, else a share of the
+/// window (`frac`).
+fn max_view_h(ui: &Ui, img: &ImageUi, frac: f32) -> f32 {
+    img.pin_h.unwrap_or_else(|| (ui.ctx().content_rect().height() * frac).max(280.0))
 }
 
 /// What a drag on the crop view moves.
@@ -136,6 +163,9 @@ impl Default for ImageUi {
             save_name: String::new(),
             saved: None,
             split: 0.5,
+            pin_h: None,
+            view_frac: VIEW_FRAC,
+            tiles_open: true,
             cancel: Arc::new(AtomicBool::new(false)),
             pending_preset: None,
             pending_write: false,
@@ -664,17 +694,98 @@ fn written_line(ui: &mut Ui, p: &Pal, wr: &render::Written) {
     });
 }
 
+/// The image steps in one scrolling page (small windows).
 pub fn main(ui: &mut Ui, a: &mut UiState, s: &mut Session, p: &Pal, tx: &Sender<Msg>) {
-    let _ = (s, tx);
+    let _ = s;
     ui.spacing_mut().item_spacing.y = 14.0;
-    if a.stack.img.targets.is_empty() {
-        w::card(ui, p, |ui| {
-            w::h2(ui, "No master lights yet");
-            w::muted(ui, p, "The image steps start from the integrated masters. Run the stacking steps through Integrate first; the masters then appear here.");
-        });
+    a.stack.img.pin_h = None;
+    if !no_targets(ui, a, p) {
+        target_picker(ui, a);
+        preview(ui, a, p);
+        below(ui, a, p, tx);
+    }
+}
+
+/// The image steps with the preview held in place: target picker and
+/// preview at the top, a handle to share the height, then the settings
+/// in their own scroll area.
+pub fn main_pinned(ui: &mut Ui, a: &mut UiState, s: &mut Session, p: &Pal, tx: &Sender<Msg>) {
+    let _ = s;
+    ui.spacing_mut().item_spacing.y = 14.0;
+    if no_targets(ui, a, p) {
         return;
     }
-    // Target picker.
+    target_picker(ui, a);
+    let room = ui.available_height();
+    let img = &mut a.stack.img;
+    let pv = (room * img.view_frac).clamp(160.0, (room - 140.0).max(160.0));
+    img.pin_h = Some(pv);
+    let y0 = ui.cursor().min.y;
+    ui.spacing_mut().item_spacing.y = 0.0;
+    preview(ui, a, p);
+    let img = &mut a.stack.img;
+    img.pin_h = None;
+    // The handle: drag to give the preview or the settings more room,
+    // double-click for the starting split.
+    let shown = ui.cursor().min.y - y0;
+    let wd = ui.available_width();
+    let (r, resp) = ui.allocate_exact_size(Vec2::new(wd, 14.0), Sense::click_and_drag());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::ResizeVertical).on_hover_text("Drag to share the height between the preview and the settings. Double-click to reset.");
+    let hot = resp.hovered() || resp.dragged();
+    ui.painter().rect_filled(Rect::from_center_size(r.center(), Vec2::new(56.0, 4.0)), 2.0, if hot { p.accent } else { p.line });
+    if resp.dragged() {
+        // From what's shown, so the handle follows the pointer even when
+        // the picture is limited by its width.
+        img.view_frac = ((shown.min(pv) + resp.drag_delta().y) / room).clamp(0.15, 0.85);
+    }
+    if resp.double_clicked() {
+        img.view_frac = VIEW_FRAC;
+    }
+    ui.spacing_mut().item_spacing.y = 14.0;
+    egui::ScrollArea::vertical().id_salt("img-settings").auto_shrink([false, false]).show(ui, |ui| {
+        // Room for the scroll bar.
+        ui.set_max_width(ui.available_width() - 12.0);
+        ui.spacing_mut().item_spacing.y = 14.0;
+        below(ui, a, p, tx);
+        ui.add_space(24.0);
+    });
+}
+
+/// The card shown before any masters exist; true when it was shown.
+fn no_targets(ui: &mut Ui, a: &UiState, p: &Pal) -> bool {
+    if !a.stack.img.targets.is_empty() {
+        return false;
+    }
+    w::card(ui, p, |ui| {
+        w::h2(ui, "No master lights yet");
+        w::muted(ui, p, "The image steps start from the integrated masters. Run the stacking steps through Integrate first; the masters then appear here.");
+    });
+    true
+}
+
+/// The stage's picture: crop box, enhance crops, or the before/after split.
+fn preview(ui: &mut Ui, a: &mut UiState, p: &Pal) {
+    match a.stack.stage {
+        Stage::Crop => crop_view(ui, a, p),
+        Stage::Enhance => enhance_view(ui, a, p),
+        _ => split(ui, a, p),
+    }
+}
+
+/// Everything under the picture: presets, settings, recipe or save.
+fn below(ui: &mut Ui, a: &mut UiState, p: &Pal, tx: &Sender<Msg>) {
+    if a.stack.stage == Stage::Palette {
+        tiles(ui, a, p);
+    }
+    w::card(ui, p, |ui| settings(ui, a, p));
+    if a.stack.stage == Stage::Crop {
+        w::card(ui, p, |ui| save_card(ui, a, p, tx));
+    } else {
+        w::card(ui, p, |ui| recipe_card(ui, a, p));
+    }
+}
+
+fn target_picker(ui: &mut Ui, a: &mut UiState) {
     if a.stack.img.targets.len() > 1 {
         let names: Vec<String> = a.stack.img.targets.iter().map(|t| format!("{}  ·  {}", t.object, t.channels().join(" "))).collect();
         let mut sel = a.stack.img.sel;
@@ -688,24 +799,6 @@ pub fn main(ui: &mut Ui, a: &mut UiState, s: &mut Session, p: &Pal, tx: &Sender<
         });
         a.stack.img.select(sel);
     }
-    if a.stack.stage == Stage::Crop {
-        crop_view(ui, a, p);
-        w::card(ui, p, |ui| settings(ui, a, p));
-        w::card(ui, p, |ui| save_card(ui, a, p, tx));
-        return;
-    }
-    if a.stack.stage == Stage::Enhance {
-        enhance_view(ui, a, p);
-        w::card(ui, p, |ui| settings(ui, a, p));
-        w::card(ui, p, |ui| recipe_card(ui, a, p));
-        return;
-    }
-    split(ui, a, p);
-    if a.stack.stage == Stage::Palette {
-        tiles(ui, a, p);
-    }
-    w::card(ui, p, |ui| settings(ui, a, p));
-    w::card(ui, p, |ui| recipe_card(ui, a, p));
 }
 
 /// The finished picture with the crop box: drag an edge or corner to
@@ -714,7 +807,7 @@ fn crop_view(ui: &mut Ui, a: &mut UiState, p: &Pal) {
     let wd = ui.available_width();
     let img = &mut a.stack.img;
     let Some(tex) = img.after.clone() else {
-        let h = (wd * 0.55).min(ui.ctx().content_rect().height() * 0.58);
+        let h = (wd * 0.55).min(max_view_h(ui, img, 0.58));
         let (r, _) = ui.allocate_exact_size(Vec2::new(wd, h), Sense::hover());
         ui.painter().rect_filled(r, 10.0, p.well);
         let msg = match &img.error {
@@ -725,7 +818,7 @@ fn crop_view(ui: &mut Ui, a: &mut UiState, p: &Pal) {
         return;
     };
     let [tw, th] = tex.size();
-    let max_h = (ui.ctx().content_rect().height() * 0.62).max(280.0);
+    let max_h = max_view_h(ui, img, 0.62) - if img.pin_h.is_some() { 20.0 } else { 0.0 };
     let (iw, ih) = if wd * th as f32 / tw as f32 > max_h { (max_h * tw as f32 / th as f32, max_h) } else { (wd, wd * th as f32 / tw as f32) };
     let (outer, _) = ui.allocate_exact_size(Vec2::new(wd, ih + 20.0), Sense::hover());
     ui.painter().rect_filled(outer, 10.0, p.well);
@@ -957,7 +1050,7 @@ fn split(ui: &mut Ui, a: &mut UiState, p: &Pal) {
     let wd = ui.available_width();
     let img = &mut a.stack.img;
     let (Some(before), Some(after)) = (img.before.clone(), img.after.clone()) else {
-        let h = (wd * 0.55).min(ui.ctx().content_rect().height() * 0.58);
+        let h = (wd * 0.55).min(max_view_h(ui, img, 0.58));
         let (r, _) = ui.allocate_exact_size(Vec2::new(wd, h), Sense::hover());
         ui.painter().rect_filled(r, 10.0, p.well);
         let msg = match (&img.error, &img.preparing) {
@@ -972,7 +1065,7 @@ fn split(ui: &mut Ui, a: &mut UiState, p: &Pal) {
         return;
     };
     let [tw, th] = after.size();
-    let max_h = (ui.ctx().content_rect().height() * 0.58).max(280.0);
+    let max_h = max_view_h(ui, img, 0.58);
     let (iw, ih) = if wd * th as f32 / tw as f32 > max_h { (max_h * tw as f32 / th as f32, max_h) } else { (wd, wd * th as f32 / tw as f32) };
     let (outer, _) = ui.allocate_exact_size(Vec2::new(wd, ih), Sense::hover());
     ui.painter().rect_filled(outer, 10.0, p.well);
@@ -1022,6 +1115,17 @@ fn tiles(ui: &mut Ui, a: &mut UiState, p: &Pal) {
         return;
     }
     let cur = img.recipe.as_ref().map(|r| r.mix.preset.clone()).unwrap_or_default();
+    // Folds away to one line, so the sliders sit right under the preview.
+    let head = format!("{}  Presets", if img.tiles_open { "▾" } else { "▸" });
+    let line = if cur.is_empty() { head } else { format!("{head}  ·  {cur}") };
+    let hint = if img.tiles_open { "Hide the preset pictures" } else { "Show the preset pictures" };
+    let resp = ui.add(egui::Label::new(RichText::new(line).font(semibold(13.0)).color(p.muted)).sense(Sense::click()));
+    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(hint).clicked() {
+        img.tiles_open = !img.tiles_open;
+    }
+    if !img.tiles_open {
+        return;
+    }
     let mut pick = None;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = Vec2::new(10.0, 10.0);
@@ -1163,7 +1267,7 @@ fn enhance_view(ui: &mut Ui, a: &mut UiState, p: &Pal) {
     let on = img.recipe.as_ref().is_some_and(|r| r.enhance.active());
     let ready = img.enh_view.clone().filter(|_| img.enh_key.ends_with(&format!("|{}|{}", img.gchan.min(img.target().map(|t| t.masters.len().saturating_sub(1)).unwrap_or(0)), img.ewhere)));
     let Some((before, after)) = ready else {
-        let h = (wd * 0.55).min(ui.ctx().content_rect().height() * 0.58);
+        let h = (wd * 0.55).min(max_view_h(ui, img, 0.58));
         let (r, _) = ui.allocate_exact_size(Vec2::new(wd, h), Sense::hover());
         ui.painter().rect_filled(r, 10.0, p.well);
         let msg = match (&img.error, &img.enh_error, &img.preparing, &img.progress) {
@@ -1176,7 +1280,7 @@ fn enhance_view(ui: &mut Ui, a: &mut UiState, p: &Pal) {
         return;
     };
     let [tw, th] = after.size();
-    let max_h = (ui.ctx().content_rect().height() * 0.58).max(280.0);
+    let max_h = max_view_h(ui, img, 0.58);
     let (iw, ih) = if wd * th as f32 / tw as f32 > max_h { (max_h * tw as f32 / th as f32, max_h) } else { (wd, wd * th as f32 / tw as f32) };
     let (outer, _) = ui.allocate_exact_size(Vec2::new(wd, ih), Sense::hover());
     ui.painter().rect_filled(outer, 10.0, p.well);

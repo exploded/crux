@@ -693,7 +693,7 @@ impl App {
                 match x {
                     "stack-map:low" => self.ui.stack.imap = 1,
                     "stack-map:high" => self.ui.stack.imap = 2,
-                    // Image stages: img-preset:<name>, img-target:<n>, img-model,
+                    // Image stages: img-preset:<name>, img-target:<n>, img-view:<f>, img-fold, img-model,
                     // img-chan:<n>, img-expert, img-auto, img-write.
                     "img-model" => self.ui.stack.img.gmodel = true,
                     "img-expert" => self.ui.stack.img.depth = crate::image::Depth::Expert,
@@ -726,6 +726,12 @@ impl App {
                 }
                 if let Some(n) = x.strip_prefix("img-preset:") {
                     self.ui.stack.img.pending_preset = Some(n.to_string());
+                }
+                if let Some(f) = x.strip_prefix("img-view:").and_then(|f| f.parse::<f32>().ok()) {
+                    self.ui.stack.img.set_view_frac(f);
+                }
+                if x == "img-fold" {
+                    self.ui.stack.img.fold_presets();
                 }
                 if let Some(n) = x.strip_prefix("img-chan:").and_then(|n| n.parse::<usize>().ok()) {
                     self.ui.stack.img.gchan = n;

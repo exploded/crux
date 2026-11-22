@@ -670,6 +670,13 @@ pub fn view(ui: &mut Ui, a: &mut UiState, s: &mut Session, tx: &Sender<Msg>) {
     }
     // Bound by what's visible: a wide row must never widen the page.
     let vis = ui.available_width();
+    // Image steps on a big enough window: the preview stays put while the
+    // settings scroll under it, so a slider and its effect are both in view.
+    let full = (vis - 14.0).min(1500.0);
+    if a.stack.stage.is_image() && a.stack.plan_error.is_none() && full >= 900.0 && ui.available_height() >= 560.0 {
+        pinned_image(ui, a, s, &p, tx, full);
+        return;
+    }
     ScrollArea::vertical().id_salt("stack").auto_shrink([false, false]).show(ui, |ui| {
         ui.set_max_width((vis - 14.0).min(1500.0));
         if a.stack.stage.is_image() {
@@ -701,6 +708,33 @@ pub fn view(ui: &mut Ui, a: &mut UiState, s: &mut Session, tx: &Sender<Msg>) {
         }
         ui.add_space(24.0);
     });
+}
+
+/// The image steps' layout: the header, then the step list in its own
+/// scroll area beside the preview, which stays in place above its own
+/// scrolling settings.
+fn pinned_image(ui: &mut Ui, a: &mut UiState, s: &mut Session, p: &Pal, tx: &Sender<Msg>, full: f32) {
+    ui.scope(|ui| {
+        ui.set_max_width(full);
+        crate::image::header(ui, a, p, tx);
+    });
+    ui.add_space(14.0);
+    let top = ui.cursor().min;
+    let h = (ui.available_height() - 6.0).max(200.0);
+    let (lw, gap) = (280.0, 16.0);
+    let col = |x: f32, wd: f32| egui::UiBuilder::new().max_rect(Rect::from_min_size(Pos2::new(top.x + x, top.y), Vec2::new(wd, h))).layout(egui::Layout::top_down(egui::Align::Min));
+    // The step list, with room for its scroll bar.
+    let mut lu = ui.new_child(col(0.0, lw + 10.0));
+    ScrollArea::vertical().id_salt("stack-steps").auto_shrink([false, false]).show(&mut lu, |ui| {
+        ui.set_max_width(lw);
+        stages(ui, a, s, p, tx);
+        ui.add_space(24.0);
+    });
+    let rw = full - lw - gap;
+    let mut ru = ui.new_child(col(lw + gap, rw));
+    ru.set_width(rw);
+    crate::image::main_pinned(&mut ru, a, s, p, tx);
+    ui.advance_cursor_after_rect(Rect::from_min_size(top, Vec2::new(full, h)));
 }
 
 /// The stages Process runs, in order.
