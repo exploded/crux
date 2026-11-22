@@ -32,6 +32,18 @@ pub struct VsLights {
     /// Large when the stack still holds the target (few lights or fields).
     #[serde(default)]
     pub halves_diff: Option<f64>,
+    /// `error.spread` with a straight tilt taken out (gradient removal takes
+    /// the tilt out of the image anyway, whether sky or flat).
+    #[serde(default)]
+    pub untilted: Option<f64>,
+    /// The same lights with no flat at all: their own fall-off (vignetting
+    /// plus any sky gradient), % peak-to-peak, and with the tilt taken out.
+    #[serde(default)]
+    pub no_flat: Option<f64>,
+    #[serde(default)]
+    pub no_flat_untilted: Option<f64>,
+    #[serde(default)]
+    pub no_flat_edges: Option<calib::Edges>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -715,6 +727,9 @@ fn flats_against_lights(
         }
         let illum = &stacks[&key];
         let err = calib::flat_against_lights(illum, flat, *w, *h);
+        let untilted = calib::untilted_spread(&err.map, *w, *h);
+        let bare = calib::flat_against_lights(illum, &vec![1f32; illum.len()], *w, *h);
+        let bare_untilted = calib::untilted_spread(&bare.map, *w, *h);
         let dust = calib::correlate(&calib::dust_fingerprint(flat, *w, *h), &calib::dust_of_lights(illum, *w, *h), *w, *h);
         if !halves.contains_key(&key) {
             let (a, b) = split_halves(ctx, &key);
@@ -783,6 +798,10 @@ fn flats_against_lights(
             dust,
             halves_diff,
             error: err,
+            untilted: Some(untilted),
+            no_flat: Some(bare.spread),
+            no_flat_untilted: Some(bare_untilted),
+            no_flat_edges: Some(bare.edges),
         });
     }
 }
@@ -826,9 +845,19 @@ fn compare_sets(ctx: &Ctx, refs: &HashMap<usize, Reference>, out: &CalCheck) -> 
     pairs
 }
 
+/// With no usable flats, a set rejected against the lights is still used
+/// when the error it leaves, tilt removed, is under this share of the
+/// lights' own with no flat (tilt removed too: gradient removal takes a
+/// tilt out either way, it can't take out vignetting). A one-pointing,
+/// light-polluted night leaves its sky gradient in the check: an 80D's
+/// flats "left 8.5%" (2.3% without the tilt) where no flat left 6.2%
+/// without the tilt, and with no flat the corners came out dark and green.
+pub const FALLBACK_GAIN: f64 = 0.8;
+
 /// For each night and filter of lights: the nearest good flat set (this
 /// folder or the library), confirmed by correlating its dust fingerprint
 /// with the night's lights. A mismatch means the optical train changed.
+/// With none usable, a rejected local set that still beats no flat.
 fn choose_flats(
     ctx: &Ctx,
     refs: &HashMap<usize, Reference>,
@@ -858,6 +887,10 @@ fn choose_flats(
         local: bool,
     }
     let mut cands: Vec<Cand> = Vec::new();
+    // Local sets rejected only for their error against the lights, with
+    // that error and the lights' own with no flat (both tilt removed): the
+    // fallback when nothing usable is left (see `FALLBACK_GAIN`).
+    let mut fallbacks: Vec<(FlatOption, String, u32, (u32, u32), f64, f64, f64)> = Vec::new();
     let mut local_ids = std::collections::HashSet::new();
     for s in &out.sets {
         let gr = &ctx.g.groups[s.group];
@@ -868,6 +901,14 @@ fn choose_flats(
         let filter = gr.filter.clone().unwrap_or_default().to_uppercase();
         let master_file = gr.master.then(|| ctx.frames[gr.members[0]].meta.file_name().to_string());
         local_ids.insert(crate::library::set_id(&filter, night, gr.binning.unwrap_or(1), gr.width, gr.height, master_file.as_deref(), gr.retired));
+        if !gr.retired && s.grade == Grade::Reject && s.flags.iter().all(|f| f.grade != Grade::Reject || f.check == Check::FlatMatch) {
+            if let Some(v) = s.vs_lights.as_ref().filter(|v| v.reliable) {
+                if let (Some(u), Some(nu)) = (v.untilted, v.no_flat_untilted) {
+                    let opt = FlatOption { label: gr.label.clone(), group: Some(gr.id), library_id: None, night, days: 0, grade: Grade::Warn, dust: None };
+                    fallbacks.push((opt, filter.clone(), gr.binning.unwrap_or(1), (gr.width, gr.height), u, nu, v.error.spread));
+                }
+            }
+        }
         if gr.retired || s.grade == Grade::Reject {
             continue;
         }
@@ -940,10 +981,34 @@ fn choose_flats(
         let target_fills = target_frac.is_some_and(|f| f > th.flat_mask_warn);
         opts.sort_by(|a, b| (a.0, a.1, a.2.grade).cmp(&(b.0, b.1, b.2.grade)));
         let mut opts: Vec<FlatOption> = opts.into_iter().map(|x| x.2).collect();
-        let chosen = (!opts.is_empty()).then(|| opts.remove(0));
+        let mut chosen = (!opts.is_empty()).then(|| opts.remove(0));
+        // Nothing usable: a rejected set that still beats no flat at all.
+        let mut fallback = None;
+        if chosen.is_none() {
+            fallback = fallbacks
+                .iter()
+                .filter(|f| f.1 == filter && f.2 == binning && f.3 == (w, h) && f.4 < FALLBACK_GAIN * f.5)
+                .min_by(|a, b| a.4.total_cmp(&b.4))
+                .map(|f| {
+                    let mut o = f.0.clone();
+                    o.days = (o.night - night).num_days();
+                    (o, f.4, f.5, f.6)
+                });
+            chosen = fallback.as_ref().map(|f| f.0.clone());
+        }
         let better = opts.iter().filter(|o| o.dust.is_some_and(|d| d >= th.dust_match)).max_by(|a, b| a.dust.partial_cmp(&b.dust).unwrap_or(std::cmp::Ordering::Equal));
         let (grade, reason) = match &chosen {
             None => (Grade::Reject, format!("no usable {filter} flats at bin {binning}")),
+            Some(c) if fallback.is_some() => {
+                let (_, u, nu, spread) = fallback.unwrap();
+                (
+                    Grade::Warn,
+                    format!(
+                        "{} ({:+} nights), though rejected: it leaves {spread:.1}% error in the lights, {u:.1}% once gradient removal takes out the tilt, against {nu:.1}% with no flat at all",
+                        c.label, c.days
+                    ),
+                )
+            }
             Some(c) => {
                 let caveat = if c.grade == Grade::Warn { " — the set has warnings, see its frames" } else { "" };
                 let when = match c.days {

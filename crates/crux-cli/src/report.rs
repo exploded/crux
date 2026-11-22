@@ -430,6 +430,22 @@ fn print_calibration_checks(t: &Triage) {
                     crux_core::calib::pct(e.bl),
                     crux_core::calib::pct(e.br)
                 );
+                if let (Some(u), Some(n), Some(nu)) = (v.untilted, v.no_flat, v.no_flat_untilted) {
+                    println!("        without the tilt {u:.1}%;  with no flat {n:.1}% ({nu:.1}% without the tilt)");
+                }
+                if let Some(e) = &v.no_flat_edges {
+                    println!(
+                        "        no flat: left {}  right {}  top {}  bottom {};  corners {} {} {} {}",
+                        crux_core::calib::pct(e.left),
+                        crux_core::calib::pct(e.right),
+                        crux_core::calib::pct(e.top),
+                        crux_core::calib::pct(e.bottom),
+                        crux_core::calib::pct(e.tl),
+                        crux_core::calib::pct(e.tr),
+                        crux_core::calib::pct(e.bl),
+                        crux_core::calib::pct(e.br)
+                    );
+                }
             }
             if let Some(o) = &s.offset {
                 println!("      offset: {o}");

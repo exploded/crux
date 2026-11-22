@@ -533,6 +533,39 @@ pub fn flat_against_lights(illumination: &[f32], flat: &[f32], w: usize, h: usiz
     FlatError { map, w, h, masked, spread, edges }
 }
 
+/// Spread (%) of a median-1 map once a straight tilt (a + bx + cy, least
+/// squares) is taken out: what gradient removal can't fix. A sky gradient
+/// left in the lights, and most of a cloudy flat's error, are tilts;
+/// vignetting and dust aren't.
+pub fn untilted_spread(map: &[f32], w: usize, h: usize) -> f64 {
+    if map.len() != w * h || w < 2 || h < 2 {
+        return spread_percent(map);
+    }
+    // Normal equations on centred coordinates (x and y are then orthogonal
+    // to the constant over a full grid).
+    let (cx, cy) = ((w - 1) as f64 / 2.0, (h - 1) as f64 / 2.0);
+    let (mut sv, mut sxv, mut syv, mut sxx, mut syy) = (0f64, 0f64, 0f64, 0f64, 0f64);
+    for y in 0..h {
+        for x in 0..w {
+            let (dx, dy, v) = (x as f64 - cx, y as f64 - cy, map[y * w + x] as f64);
+            sv += v;
+            sxv += dx * v;
+            syv += dy * v;
+            sxx += dx * dx;
+            syy += dy * dy;
+        }
+    }
+    let n = (w * h) as f64;
+    let (a, b, c) = (sv / n, sxv / sxx, syv / syy);
+    let res: Vec<f32> = (0..w * h)
+        .map(|i| {
+            let (dx, dy) = ((i % w) as f64 - cx, (i / w) as f64 - cy);
+            (map[i] as f64 - (b * dx + c * dy) - a + 1.0) as f32
+        })
+        .collect();
+    spread_percent(&res)
+}
+
 /// Dust shadows on the ASI2600 at f/4 are 300–600 px across. A band-pass
 /// from 64 to 256 px keeps them and drops vignetting (larger) and noise,
 /// stars and target residue (smaller).
@@ -630,6 +663,18 @@ mod tests {
         assert_eq!((m.w, m.h), (2, 1));
         assert!((m.data[0] - 15.5).abs() < 1e-3 && (m.data[1] - 47.5).abs() < 1e-3, "{:?}", m.data);
         assert_eq!(Map::from_bytes(&m.to_bytes()), Some(m));
+    }
+
+    #[test]
+    fn untilted_spread_keeps_vignetting_and_drops_a_tilt() {
+        let (w, h) = (195, 130);
+        let tilt = ramp(w, h, |x, y| 1.0 + 0.08 * (x - 0.5) - 0.03 * (y - 0.5));
+        assert!(spread_percent(&tilt) > 7.0);
+        assert!(untilted_spread(&tilt, w, h) < 1.0, "{}", untilted_spread(&tilt, w, h));
+        let vig = ramp(w, h, |x, y| 1.0 - 0.3 * ((x - 0.5).powi(2) + (y - 0.5).powi(2)));
+        let both = ramp(w, h, |x, y| (1.0 - 0.3 * ((x - 0.5).powi(2) + (y - 0.5).powi(2))) * (1.0 + 0.08 * (x - 0.5)));
+        let (sv, sb) = (untilted_spread(&vig, w, h), untilted_spread(&both, w, h));
+        assert!(sv > 10.0 && (sb - sv).abs() < 1.5, "{sv} {sb}");
     }
 
     #[test]

@@ -353,10 +353,12 @@ pub fn plan(t: &Triage, root: &Path, decisions: Option<&Decisions>, settings: &S
     let mut notes = Vec::new();
     let group_of = |i: usize| groups.iter().find(|g| g.kind == FrameType::Light && g.members.contains(&i));
     let cal_grade: HashMap<usize, Grade> = t.cal.reports.iter().map(|r| (r.frame, r.grade)).collect();
-    // Flat sets you chose: the set's verdict against the lights (copied to
-    // every frame) is the one you overrode, so only a frame's own problems
-    // leave it out. Without this, choosing a rejected set left no frames.
-    let pinned_flats: HashSet<usize> = t.cal.choices.iter().filter(|c| c.pinned).filter_map(|c| c.chosen.as_ref()?.group).collect();
+    // Flat sets chosen for some lights (by you, or by crux as better than no
+    // flat): the set's verdict against the lights, copied to every frame,
+    // was overridden, so only a frame's own problems leave it out. Without
+    // this, choosing a rejected set left no frames. Sets crux chose for
+    // being usable carry no rejecting verdict, so nothing changes for them.
+    let pinned_flats: HashSet<usize> = t.cal.choices.iter().filter_map(|c| c.chosen.as_ref()?.group).collect();
     let own_reject: HashSet<usize> = t.cal.reports.iter().filter(|r| r.flags.iter().any(|f| f.grade == Grade::Reject && f.check != crate::grade::Check::FlatMatch)).map(|r| r.frame).collect();
     // A master or raw set → Source.
     let source_of_group = |gid: usize, offset: Option<Source>, out_name: String| -> Option<Source> {
