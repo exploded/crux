@@ -1,4 +1,4 @@
-//! Small building blocks styled like the mockup: cards, pills, chips,
+//! Small building blocks: cards, pills, chips,
 //! segmented controls, buttons and key caps.
 
 use crate::theme::{self, alpha, body, mix, mono, semibold, Pal};

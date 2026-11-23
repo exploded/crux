@@ -345,7 +345,9 @@ mod tests {
         d.dismissed.insert("masters".into());
         d.save().unwrap();
         let mut e = Decisions::load(&dir).unwrap();
-        assert_eq!(e.get(Path::new("c:/x/a.fits")), Some(Grade::Reject));
+        assert_eq!(e.get(Path::new("C:/x/A.fits")), Some(Grade::Reject));
+        // Path keys ignore case on Windows only.
+        assert_eq!(e.get(Path::new("c:/x/a.fits")).is_some(), cfg!(windows));
         assert!(e.rename(Path::new("C:/x/A.fits"), Path::new("C:/x/BAD/A.fits")));
         assert_eq!(e.get(Path::new("C:/x/BAD/A.fits")), Some(Grade::Reject));
         let mut cfg = Config::default();

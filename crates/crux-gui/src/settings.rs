@@ -1,5 +1,5 @@
 //! Settings page: the per-user `crux.toml` (`%APPDATA%\crux\crux.toml`),
-//! the rail's Settings entry from `docs/ui-design.md`. Only values that
+//! the rail's Settings entry. Only values that
 //! differ from crux's defaults are saved (`Config::save_user`), so later
 //! default changes still apply. A folder's own `crux.toml` is used instead
 //! of this file; the page says so when the open folder has one.

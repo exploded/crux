@@ -1,4 +1,4 @@
-//! Colours, fonts and egui style, from the mockup (`docs/mockup/src.html`).
+//! Colours, fonts and egui style.
 //! Dark only.
 
 use crux_core::grade::Grade;
