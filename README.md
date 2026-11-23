@@ -4,18 +4,14 @@ crux is an astrophotography image toolkit. It takes a night's raw subs from
 capture software such as N.I.N.A. or an ASIAIR, and goes all the way to a
 finished image. It grades every frame, matches calibration frames, then
 calibrates, registers, integrates, builds mosaics and renders colour images.
-It has a desktop app (`crux-gui`) and a command-line tool (`crux`).
-
-**Status:** in development. crux is used daily on Windows. Builds for Linux
-and macOS are made the same way, but haven't been tested on a real machine
-yet: reports are welcome.
+**Status:** in development, used daily on Windows. The tests run on
+Windows, Linux and macOS.
 
 ## Download
 
 Builds for Windows (x86-64), Linux (x86-64) and macOS (Apple Silicon) are on
-the [Releases](https://github.com/exploded/crux/releases) page. Each archive
-holds `crux-gui` and `crux`; there's nothing to install. Unpack it and run
-`crux-gui`.
+the [Releases](https://github.com/exploded/crux/releases) page. There's
+nothing to install: unpack the archive and run `crux-gui`.
 
 The builds aren't signed, so the first run needs one extra step:
 
@@ -25,7 +21,7 @@ The builds aren't signed, so the first run needs one extra step:
   folder:
 
   ```sh
-  xattr -d com.apple.quarantine crux crux-gui
+  xattr -d com.apple.quarantine crux-gui
   ```
 
 - **Linux:** needs glibc 2.35 or later (Ubuntu 22.04, Debian 12, Fedora 36
@@ -88,20 +84,6 @@ The rail on the left has these pages:
 
 The top bar shows whether crux is computing on the graphics card (GPU) or
 the processor (CPU).
-
-## Command line
-
-The `crux` tool does the same work from a terminal or a script. For example:
-
-```sh
-crux report <folder> --html report.html   # grade a folder
-crux plan <folder>                        # plan moving its rejects
-crux process <folder>                     # calibrate, register, integrate
-crux image <folder>                       # render the finished image
-crux autopilot <library folder>           # all of it, for every dated folder
-```
-
-Run `crux --help` for the full command list.
 
 ## Build from source
 
@@ -170,13 +152,27 @@ The binaries are in `target/release`.
   needs a C compiler). Without it, the index falls back to JSON and there's
   no flat library.
 
+### Command line
+
+The build also makes `crux`, a command-line tool that does the same work
+from a terminal or a script. It's used for testing, validation and training
+crux's networks, and isn't included in releases. Run `crux --help` for its
+commands. For example:
+
+```sh
+crux report <folder> --html report.html   # grade a folder
+crux process <folder>                     # calibrate, register, integrate
+crux image <folder>                       # render the finished image
+crux collect <folder>                     # make training bundles
+```
+
 ### Releases
 
 GitHub Actions runs the tests on Windows, Linux and macOS on every push.
-Pushing a version tag such as `v0.1.0` builds crux and crux-gui for all
-three and attaches them to a draft release, which is published by hand. The
-Build workflow can also be run from the Actions tab; its builds are then
-attached to that run.
+Pushing a version tag such as `v0.1.0` builds crux-gui for all three and
+attaches it to a draft release, which is published by hand. The Build
+workflow can also be run from the Actions tab; its builds are then attached
+to that run.
 
 ## Optional tools
 
@@ -185,15 +181,14 @@ attached to that run.
   in the folder named by `CRUX_CATALOG`. It reads the catalogue directly and
   doesn't run ASTAP itself.
 - **RC Astro tools:** if you own licences for RC Astro's command-line tools,
-  `crux rc-astro` and the Image stage can run them on your images. crux isn't
+  the Image stage can run them on your images. crux isn't
   affiliated with RC Astro and doesn't include its software. RC Astro's
   software and its outputs aren't used to develop or evaluate crux's
   networks.
 
 ## Settings
 
-`crux config` prints every setting and its default value. Most can also be
-changed on the app's Settings page. To change a setting by hand, put it in
+Most settings are on the app's Settings page. To change one by hand, put it in
 `crux.toml` in the data folder (for that folder only), or in your own
 `crux.toml` (for all folders):
 
@@ -225,20 +220,19 @@ Windows and `crux-work` in that same folder elsewhere; change it under
 ## Starting again
 
 To have crux work everything out again from a fresh scan, use **Start
-fresh** in Settings (or on the library's Home page), or run `crux fresh`. It
+fresh** in Settings (or on the library's Home page). It
 empties every folder's measurements, removes the caches of folders that no
 longer exist, moves the library index aside as a backup, and clears
 processing outputs in the workspace: only the intermediate files (registered
 frames and caches), or everything crux made there, finished images included.
-Your data stays, and so do your decisions unless you ask. `crux fresh
---dry-run` shows what it would clear.
+Your data stays, and so do your decisions unless you ask.
 
 ## Layout
 
 | Folder | Contents |
 |---|---|
 | `crates/crux-core` | The library: file readers, measurement, grading, calibration, processing and rendering. |
-| `crates/crux-cli` | The `crux` command-line tool. |
+| `crates/crux-cli` | The `crux` command-line tool, for testing and training. |
 | `crates/crux-gui` | The `crux-gui` desktop app (egui on wgpu). |
 | `tools/ml` | Training scripts for crux's networks (PyTorch). See its [README](tools/ml/README.md). |
 
