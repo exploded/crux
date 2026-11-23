@@ -11,6 +11,7 @@ mod auto;
 mod calibrate;
 mod chart;
 mod frames;
+mod fresh;
 mod home;
 mod image;
 mod inbox;

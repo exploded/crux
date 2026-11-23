@@ -21,6 +21,7 @@ pub mod config;
 pub mod decisions;
 pub mod export;
 pub mod fingerprint;
+pub mod fresh;
 pub mod fits;
 pub mod gpu;
 pub mod grade;

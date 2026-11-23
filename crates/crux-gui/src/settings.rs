@@ -86,9 +86,12 @@ pub fn show(ui: &mut Ui, a: &mut UiState, s: Option<&mut Session>) {
     let mut d = a.settings.draft.take().unwrap_or_default();
     let ixp = a.index_path.clone();
     let current = root.clone().or_else(|| a.lib.view.as_ref().map(|v| v.root.clone()));
-    let lib = &mut a.lib;
+    let fresh_cfg = s.as_ref().map(|s| s.cfg.clone()).unwrap_or_else(|| a.settings.saved.clone());
+    let busy = crate::fresh::busy(a);
+    let explicit = a.lib.cache_override.clone();
+    let fresh = &mut a.fresh;
     let st = &mut a.settings;
-    let mut reset = false;
+    let mut go_fresh = false;
     egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(ui.available_height() - 56.0).show(ui, |ui| {
         processing(ui, &p, st, &mut d, &def);
         ui.add_space(10.0);
@@ -96,7 +99,7 @@ pub fn show(ui: &mut Ui, a: &mut UiState, s: Option<&mut Session>) {
         ui.add_space(10.0);
         site(ui, &p, &mut d, &def);
         ui.add_space(10.0);
-        reset = crate::libview::reset_card(ui, &p, lib, ixp.as_deref());
+        go_fresh = crate::fresh::card(ui, &p, fresh, busy, ixp.as_deref(), explicit.as_deref(), &fresh_cfg);
         ui.add_space(10.0);
     });
 
@@ -155,8 +158,8 @@ pub fn show(ui: &mut Ui, a: &mut UiState, s: Option<&mut Session>) {
         });
     }
     a.settings.draft = Some(d);
-    if reset {
-        crate::libview::do_reset(a, ui.ctx(), current.as_deref());
+    if go_fresh {
+        crate::fresh::go(a, &fresh_cfg, current.as_deref());
     }
 }
 

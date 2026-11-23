@@ -81,8 +81,6 @@ pub struct LibUi {
     /// entries are renamed there in place.
     pub cache_override: Option<PathBuf>,
     pub error: Option<String>,
-    /// "Reset the library index": asked once, then done.
-    pub confirm_reset: bool,
 }
 
 /// Where library-level plans and journals go (combines).
@@ -292,8 +290,10 @@ pub fn show(ui: &mut egui::Ui, a: &mut UiState) {
                 });
             }
             ui.add_space(16.0);
-            if reset_card(ui, &p, &mut a.lib, a.index_path.clone().as_deref()) {
-                do_reset(a, ui.ctx(), Some(&root));
+            let busy = crate::fresh::busy(a);
+            let (ix, explicit) = (a.index_path.clone(), a.lib.cache_override.clone());
+            if crate::fresh::card(ui, &p, &mut a.fresh, busy, ix.as_deref(), explicit.as_deref(), &v.cfg) {
+                crate::fresh::go(a, &v.cfg, Some(&root));
             }
         };
         if wide {
@@ -395,60 +395,4 @@ fn add_library_folder(dir: &Path) -> anyhow::Result<PathBuf> {
     }
     c.library.search = roots;
     c.save_user()
-}
-
-/// Settings and the library: start the index again. Returns true once
-/// confirmed; the caller then runs [`do_reset`].
-pub fn reset_card(ui: &mut egui::Ui, p: &crate::theme::Pal, lib: &mut LibUi, index: Option<&Path>) -> bool {
-    let mut go = false;
-    w::card(ui, p, |ui| {
-        w::h2(ui, "Start the index again");
-        ui.add(
-            egui::Label::new(
-                RichText::new("The library index remembers every file crux has read, its plate solutions and the flat library. Starting again moves it aside as a backup; opening folders and refreshing the calibration library rebuild it. Your data and your decisions aren't touched.")
-                    .font(body(12.5))
-                    .color(p.muted),
-            )
-            .wrap(),
-        );
-        ui.add_space(6.0);
-        let Some(ix) = index else {
-            ui.label(RichText::new("No index in use.").font(body(12.0)).color(p.muted));
-            return;
-        };
-        ui.horizontal(|ui| {
-            if !lib.confirm_reset {
-                if w::button(ui, p, "Start again…", Kind::Normal, None).clicked() {
-                    lib.confirm_reset = true;
-                }
-            } else {
-                if w::button(ui, p, "Move the index aside", Kind::Danger, None).clicked() {
-                    lib.confirm_reset = false;
-                    go = true;
-                }
-                if w::button(ui, p, "Cancel", Kind::Ghost, None).clicked() {
-                    lib.confirm_reset = false;
-                }
-            }
-        });
-        ui.add(egui::Label::new(RichText::new(crux_core::index::Index::db_path(ix).display().to_string()).font(mono(11.5)).color(p.faint)).wrap());
-        if let Some(e) = &lib.error {
-            ui.label(RichText::new(e).font(body(12.0)).color(p.rej));
-        }
-    });
-    go
-}
-
-/// Move the index aside, then reopen `current`.
-pub fn do_reset(a: &mut UiState, ctx: &egui::Context, current: Option<&Path>) {
-    let Some(ix) = a.index_path.clone() else { return };
-    match crux_core::index::Index::reset(&ix) {
-        Ok(Some(b)) => {
-            a.toast(ctx, format!("Index moved aside to {}. Rebuilding as folders open.", b.display()), false);
-            a.library.clear();
-            a.open_request = current.map(Path::to_path_buf);
-        }
-        Ok(None) => a.toast(ctx, "There was no index to start again.", false),
-        Err(e) => a.lib.error = Some(format!("{e:#}")),
-    }
 }

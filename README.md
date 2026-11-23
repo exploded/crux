@@ -23,7 +23,7 @@ been built or run there.
   its dust pattern. Matches darks and bias by their hot-pixel fingerprint.
 - **Filing:** moves rejects and reorganises folders through a plan you
   preview first. Every move is journalled and can be undone. crux never
-  deletes files.
+  deletes your data.
 - **Processing:** calibration, hot-pixel correction, plate solving (with
   ASTAP's star catalogue), registration, integration with normalisation,
   weighting and pixel rejection, and mosaics with lens-distortion correction
@@ -122,6 +122,17 @@ timezone = "Australia/Melbourne"
 
 To always compute on the CPU, set `use = "off"` under `[gpu]` (or the
 environment variable `CRUX_GPU=off`).
+
+## Starting again
+
+To have crux work everything out again from a fresh scan, use **Start
+fresh** in Settings (or on the library's Home page), or run `crux fresh`. It
+empties every folder's measurements, removes the caches of folders that no
+longer exist, moves the library index aside as a backup, and clears
+processing outputs in the workspace: only the intermediate files (registered
+frames and caches), or everything crux made there, finished images included.
+Your data stays, and so do your decisions unless you ask. `crux fresh
+--dry-run` shows what it would clear.
 
 ## Acknowledgements
 

@@ -141,6 +141,8 @@ pub struct UiState {
     pub settings: crate::settings::SettingsUi,
     /// Library mode (a folder of targets).
     pub lib: crate::libview::LibUi,
+    /// Settings' Start fresh card.
+    pub fresh: crate::fresh::FreshUi,
 }
 
 impl UiState {
@@ -278,6 +280,7 @@ impl App {
                 stack: crate::stack::StackUi::default(),
                 settings: crate::settings::SettingsUi::default(),
                 lib: crate::libview::LibUi { cache_override: args.cache_dir.clone(), ..Default::default() },
+                fresh: Default::default(),
                 index_path: None,
                 request: None,
             },
@@ -632,6 +635,11 @@ impl App {
             let o = sh.opts.clone();
             let has = |k: &str| o.split(',').any(|x| x.trim() == k);
             self.ui.fu.marks = has("marks");
+            // Settings: show Start fresh's choices (measured only; never cleared here).
+            if has("fresh") || has("fresh-go") {
+                self.ui.fresh.pending_open = true;
+                self.ui.fresh.harness_go = has("fresh-go");
+            }
             self.ui.fu.grid = has("grid");
             if has("blink") {
                 self.ui.fu.mode = viewer::Mode::Reference;
@@ -851,7 +859,7 @@ impl App {
             }
             return;
         }
-        if self.moving.is_some() || self.ui.loading.is_some() || self.ui.org.dup_progress.is_some() || self.ui.stack.running.is_some() || self.ui.stack.solving.is_some() || self.ui.bg.refresh.running || self.ui.open_request.is_some() {
+        if self.moving.is_some() || self.ui.loading.is_some() || self.ui.org.dup_progress.is_some() || self.ui.stack.running.is_some() || self.ui.stack.solving.is_some() || self.ui.bg.refresh.running || self.ui.open_request.is_some() || self.ui.fresh.measuring() {
             sh.frames_ready = 1;
             return;
         }
@@ -880,13 +888,16 @@ impl App {
         if !sh.applied {
             sh.applied = true;
             self.ui.view = if sh.view.as_deref() == Some("settings") { View::Settings } else { View::Home };
+            if sh.opts.split(',').any(|x| x.trim() == "fresh") {
+                self.ui.fresh.pending_open = true;
+            }
             sh.pending = sh.opts.split(',').map(|x| x.trim().to_string()).filter(|x| matches!(x.as_str(), "lib-combine" | "lib-auto-combine" | "lib-auto-undo")).collect();
         }
         let ready = self.ui.gallery.len() >= v.images.len() || ctx.input(|i| i.time) > 60.0;
         if ready {
             sh.frames_ready += 1;
         }
-        if self.moving.is_some() || self.ui.loading.is_some() || self.ui.bg.refresh.running || self.ui.open_request.is_some() {
+        if self.moving.is_some() || self.ui.loading.is_some() || self.ui.bg.refresh.running || self.ui.open_request.is_some() || self.ui.fresh.measuring() {
             sh.frames_ready = 1;
             return;
         }
@@ -954,6 +965,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
+        crate::fresh::tick(&mut self.ui, &ctx);
         self.shot_step(&ctx);
         self.keys(&ctx);
         // Folders dropped on the window.

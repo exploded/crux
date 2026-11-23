@@ -194,6 +194,12 @@ impl ImageUi {
         self.after.is_some() && (self.prep_key.is_empty() || self.preparing.is_none()) && !self.writing && !self.pending_write || self.error.is_some()
     }
 
+    /// Preparing, enhancing or writing in the background (files in the
+    /// workspace are in use).
+    pub fn busy(&self) -> bool {
+        self.writing || self.preparing.is_some() || self.enh_loading.is_some()
+    }
+
     /// Sharpen and denoise stage: its crops are on screen (or failed).
     pub fn enhance_ready(&self) -> bool {
         (self.enh_view.is_some() && self.enh_loading.is_none() && self.preparing.is_none() && self.pending_enhance.is_empty()) || self.enh_error.is_some() || self.error.is_some()

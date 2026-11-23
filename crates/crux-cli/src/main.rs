@@ -409,6 +409,35 @@ enum Cmd {
         #[command(subcommand)]
         what: Option<CacheCmd>,
     },
+    /// Start again from a fresh scan: empty every folder's measurements,
+    /// maps and thumbnails, remove the caches of folders that no longer
+    /// exist, move the library index aside (kept as a backup), and clear
+    /// processing outputs in the workspace. Your data is never touched, and
+    /// your decisions stay unless --decisions. Then run `crux library
+    /// refresh` and open your folders.
+    Fresh {
+        /// Workspace outputs to clear: "intermediates" (registered and
+        /// calibrated frames, network and preview caches; masters and
+        /// images stay), "all" (everything crux made there, images and
+        /// recipes too) or "keep".
+        #[arg(long, default_value = "intermediates")]
+        work: String,
+        /// More workspaces to clear, besides process.workspace.
+        #[arg(long = "workspace")]
+        workspaces: Vec<PathBuf>,
+        /// Also forget your decisions: kept and rejected frames, flat
+        /// choices, panel corrections, layout rules and saved views.
+        #[arg(long)]
+        decisions: bool,
+        /// Keep the library index and flat library.
+        #[arg(long)]
+        keep_index: bool,
+        /// Only show what would be cleared.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        yes: bool,
+    },
     /// Validation tools for processing.
     #[command(hide = true)]
     Dev {
@@ -531,7 +560,7 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    if !cli.no_cache && cli.cache_dir.is_none() && !matches!(cli.cmd, Cmd::Cache { .. }) {
+    if !cli.no_cache && cli.cache_dir.is_none() && !matches!(cli.cmd, Cmd::Cache { .. } | Cmd::Fresh { .. }) {
         if let Ok((cfg, _)) = Config::load(cli.config.as_deref(), None) {
             let (n, b) = crux_core::cachedir::auto_clean(cfg.cache.unused_days);
             if n > 0 {
@@ -864,6 +893,63 @@ fn run() -> Result<()> {
         Cmd::Dev { cmd } => dev::run(cmd, &|d| triage(&cli, d, true).map(|x| x.1))?,
         Cmd::Preview { file, out, size } => preview(&cli, file, out, *size)?,
         Cmd::Cache { what } => cache_cmd(&cli, what.as_ref().unwrap_or(&CacheCmd::List))?,
+        Cmd::Fresh { work, workspaces, decisions, keep_index, dry_run, yes } => {
+            use crux_core::fresh::{self, Work};
+            let (cfg, _) = Config::load(cli.config.as_deref(), None)?;
+            let work = match work.to_lowercase().as_str() {
+                "intermediates" => Work::Intermediates,
+                "all" => Work::All,
+                "keep" | "none" => Work::Keep,
+                w => anyhow::bail!("--work {w}: use intermediates, all or keep"),
+            };
+            let mut ws = vec![cfg.process.workspace.clone()];
+            ws.extend(workspaces.iter().cloned());
+            let ix = crux_core::cachedir::default_index(cli.cache_dir.as_deref());
+            let s = fresh::survey(ix.as_deref(), cli.cache_dir.as_deref(), &ws, &cfg.library.search_roots());
+            let o = fresh::Options { measurements: true, missing: true, index: !keep_index, work, decisions: *decisions };
+            let b = report::bytes;
+            let existing = s.caches.iter().filter(|c| c.folder_exists).count() + usize::from(s.explicit.is_some());
+            println!("Starting fresh clears:");
+            println!("  measurements, maps and thumbnails of {existing} folder(s): {}", b(s.measurement_bytes()));
+            if s.missing().count() > 0 {
+                println!("  caches of {} folder(s) that no longer exist: {}", s.missing().count(), b(s.missing_bytes()));
+            }
+            match (&s.index, o.index) {
+                (Some(ix), true) => println!("  the library index and flat library, moved aside as a backup: {}", crux_core::index::Index::db_path(ix).display()),
+                (Some(_), false) => println!("  (the library index stays)"),
+                (None, _) => println!("  (no library index yet)"),
+            }
+            for w in &s.workspaces {
+                let n = s.work.iter().filter(|f| f.dir.starts_with(w)).count();
+                if n == 0 {
+                    println!("  (nothing crux made in {})", w.display());
+                    continue;
+                }
+                match work {
+                    Work::Keep => println!("  (processing outputs in {} stay)", w.display()),
+                    Work::Intermediates => println!("  registered and calibrated frames, network and preview caches in {} ({n} folder(s)): {}", w.display(), b(s.work_bytes(work))),
+                    Work::All => println!("  everything crux made in {} ({n} folder(s), images and recipes included): {}", w.display(), b(s.work_bytes(work))),
+                }
+            }
+            for r in &s.refused {
+                println!("  left alone: {r}");
+            }
+            println!("  your decisions: {}", if *decisions { format!("removed ({})", b(s.decision_bytes())) } else { "kept".into() });
+            println!("Your data isn't touched. About {} would be freed.", b(s.bytes(&o)));
+            if *dry_run {
+                return Ok(());
+            }
+            confirm(*yes, "Start fresh?")?;
+            let d = fresh::run(&s, &o)?;
+            println!("{}", d.summary());
+            for e in &d.errors {
+                println!("  {e}");
+            }
+            if let Some(bak) = &d.index_backup {
+                println!("The old index is at {}", bak.display());
+            }
+            println!("Next: `crux library refresh`, then open your folders.");
+        }
         Cmd::Watch { dir, interval, duration, summary, night } => watch(&cli, dir, *interval, *duration, *summary, *night)?,
         Cmd::Autopilot { root, workspace, dry_run, only, no_images } => autopilot(&cli, root, workspace.as_deref(), *dry_run, only.as_deref(), *no_images)?,
         Cmd::Mosaic { dir, workspace, target, bin, feather, no_distortion, no_match, no_curvature, force } => {
