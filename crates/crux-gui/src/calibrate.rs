@@ -85,6 +85,13 @@ fn heat_image(map: &[f32], w: usize, h: usize, range: f32) -> egui::ColorImage {
     egui::ColorImage { size: [w, h], pixels: px, source_size: Vec2::new(w as f32, h as f32) }
 }
 
+/// Distance from `m` to the segment `a`–`b`.
+fn seg_dist(m: Pos2, a: Pos2, b: Pos2) -> f32 {
+    let ab = b - a;
+    let t = if ab.length_sq() > 0.0 { ((m - a).dot(ab) / ab.length_sq()).clamp(0.0, 1.0) } else { 0.0 };
+    m.distance(a + ab * t)
+}
+
 fn short(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
@@ -201,7 +208,7 @@ fn graph(ui: &mut Ui, a: &mut UiState, s: &mut Session, p: &Pal) {
     ui.horizontal(|ui| {
         w::h2(ui, "Matching");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new("dashed: check this · drag a library set onto a night").font(body(11.5)).color(p.muted));
+            ui.label(RichText::new("dashed: check this flat (point at a line for why) · drag a library set onto a night").font(body(11.5)).color(p.muted));
         });
     });
     ui.add_space(6.0);
@@ -214,7 +221,7 @@ fn graph(ui: &mut Ui, a: &mut UiState, s: &mut Session, p: &Pal) {
     let top = 26.0;
     let wd = ui.available_width().max(360.0);
     let ht = top + row_h * choices.len() as f32 + 8.0;
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(wd, ht), Sense::hover());
+    let (rect, graph_resp) = ui.allocate_exact_size(Vec2::new(wd, ht), Sense::hover());
     let pa = ui.painter_at(rect.expand(2.0));
     let (c1, c2, c3) = (rect.left(), rect.left() + wd * 0.40, rect.left() + wd * 0.74);
     let lw = wd * 0.27;
@@ -249,8 +256,8 @@ fn graph(ui: &mut Ui, a: &mut UiState, s: &mut Session, p: &Pal) {
     let bias_y = ly(choices.len().saturating_sub(1)).max(dark_y + row_h * 1.5);
     let nw = c3 - c2 - 18.0;
     let ow = rect.right() - c3 - 2.0;
-    let curve = |pa: &egui::Painter, a: Pos2, b: Pos2, st: Stroke, dashed: bool| {
-        let pts: Vec<Pos2> = (0..=16)
+    let bezier = |a: Pos2, b: Pos2| -> Vec<Pos2> {
+        (0..=16)
             .map(|k| {
                 let t = k as f32 / 16.0;
                 let (mx1, mx2) = (a.x + (b.x - a.x) * 0.5, a.x + (b.x - a.x) * 0.5);
@@ -259,20 +266,42 @@ fn graph(ui: &mut Ui, a: &mut UiState, s: &mut Session, p: &Pal) {
                 let y = u * u * u * a.y + 3.0 * u * u * t * a.y + 3.0 * u * t * t * b.y + t * t * t * b.y;
                 Pos2::new(x, y)
             })
-            .collect();
+            .collect()
+    };
+    let draw = |pa: &egui::Painter, pts: Vec<Pos2>, st: Stroke, dashed: bool| {
         if dashed {
             pa.extend(egui::Shape::dashed_line(&pts, st, 4.0, 3.0));
         } else {
             pa.add(egui::Shape::line(pts, st));
         }
     };
+    let curve = |pa: &egui::Painter, a: Pos2, b: Pos2, st: Stroke, dashed: bool| draw(pa, bezier(a, b), st, dashed);
+    // The light → flat link under the pointer (nearest within 6 px), for its tooltip.
+    let pointer = graph_resp.hover_pos();
+    let links: Vec<Vec<Pos2>> = choices
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let key = c.chosen.as_ref().map(|o| o.library_id.clone().or(o.group.map(|g| format!("g{g}"))).unwrap_or_else(|| o.label.clone())).unwrap_or_else(|| "none".into());
+            let y = ly(i);
+            bezier(Pos2::new(c1 + lw, y), Pos2::new(c2, node_y.get(&key).copied().unwrap_or(y)))
+        })
+        .collect();
+    let hovered_link = pointer.and_then(|m| {
+        links
+            .iter()
+            .enumerate()
+            .map(|(i, pts)| (i, pts.windows(2).map(|s| seg_dist(m, s[0], s[1])).fold(f32::MAX, f32::min)))
+            .filter(|(_, d)| *d <= 6.0)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(i, _)| i)
+    });
     // Links first, nodes on top.
     for (i, c) in choices.iter().enumerate() {
         let y = ly(i);
-        let key = c.chosen.as_ref().map(|o| o.library_id.clone().or(o.group.map(|g| format!("g{g}"))).unwrap_or_else(|| o.label.clone())).unwrap_or_else(|| "none".into());
-        let ny = node_y.get(&key).copied().unwrap_or(y);
         let col = if c.pinned { p.accent } else { p.grade(c.grade) };
-        curve(&pa, Pos2::new(c1 + lw, y), Pos2::new(c2, ny), Stroke::new(1.5, alpha(col, 0.75)), c.grade != Grade::Good);
+        let hot = hovered_link == Some(i);
+        draw(&pa, links[i].clone(), Stroke::new(if hot { 2.5 } else { 1.5 }, alpha(col, if hot { 1.0 } else { 0.75 })), c.grade != Grade::Good);
         if dark.is_some() {
             curve(&pa, Pos2::new(c1 + lw, y), Pos2::new(c3, dark_y), Stroke::new(1.0, alpha(p.faint, 0.45)), false);
         }
@@ -344,6 +373,19 @@ fn graph(ui: &mut Ui, a: &mut UiState, s: &mut Session, p: &Pal) {
                 pa.text(Pos2::new(r.left() + 8.0, y), egui::Align2::LEFT_CENTER, format!("{} {t}", if what == "dark" { "Dark" } else { "Bias" }), body(11.5), p.muted);
             }
         }
+    }
+    if let Some(i) = hovered_link {
+        let c = &choices[i];
+        let head = match (c.pinned, c.grade) {
+            (true, _) => "Your choice",
+            (_, Grade::Good) => "Good match",
+            (_, Grade::Warn) => "Check this flat",
+            _ => "No usable flat",
+        };
+        let flat = c.chosen.as_ref().map(|o| opt_name(o, s)).unwrap_or_else(|| "no flats".into());
+        let tip = format!("{head}: {} {} → {flat}\n\n{}\n\nClick the night for alternatives, or drag a library set onto it.", c.filter, d_short(c.night), c.reason);
+        graph_resp.on_hover_text_at_pointer(tip);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Help);
     }
     if let Some((i, d)) = picked {
         let c = &choices[i];
