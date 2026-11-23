@@ -27,6 +27,47 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+/// The smallest value a pixel with data gets: zero means "no data" to
+/// everything downstream (mosaic warps, the Image stage's empty-edge
+/// tests), so data must never land on it.
+pub const MIN_DATA: f32 = 1.0e-5;
+
+/// Keep an output's data positive: `NaN` marks pixels without data (they
+/// become 0). When the 0.05th percentile of the data is below 1e-4 (a
+/// faint narrowband sky whose noise reaches zero), everything is lifted by
+/// a pedestal so it sits at 1e-4; whatever is still below [`MIN_DATA`] is
+/// clamped there, never to 0. Returns the pedestal and how many data
+/// pixels were clamped to [`MIN_DATA`, 1].
+pub fn keep_positive(data: &mut [f32]) -> (f32, u64) {
+    let mut sample: Vec<f32> = data.iter().step_by(97).copied().filter(|v| v.is_finite()).collect();
+    let lo = if sample.is_empty() {
+        0.0
+    } else {
+        let k = sample.len() / 2000;
+        *sample.select_nth_unstable_by(k, |a, b| a.total_cmp(b)).1
+    };
+    let lift = if lo < 1e-4 { 1e-4 - lo } else { 0.0 };
+    let clamped = data
+        .par_chunks_mut(1 << 16)
+        .map(|c| {
+            let mut n = 0u64;
+            for v in c {
+                if v.is_finite() {
+                    let x = *v + lift;
+                    if !(MIN_DATA..=1.0).contains(&x) {
+                        n += 1;
+                    }
+                    *v = x.clamp(MIN_DATA, 1.0);
+                } else {
+                    *v = 0.0;
+                }
+            }
+            n
+        })
+        .sum();
+    (lift, clamped)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Normalisation {
@@ -151,7 +192,7 @@ pub struct Report {
     /// Weighted FWHM of the frames, pixels.
     pub fwhm: Option<f64>,
     pub what_ifs: Vec<WhatIf>,
-    /// Pixels clipped to [0, 1].
+    /// Pixels with data clipped to [`MIN_DATA`, 1] (after any pedestal).
     pub clamped: u64,
     pub seconds: f64,
 }
@@ -637,7 +678,7 @@ pub fn integrate(
     let mut map_lo = vec![0f32; w * h];
     let mut map_hi = vec![0f32; w * h];
     let combined = AtomicUsize::new(0);
-    let per_strip: Vec<Result<(Vec<(u64, u64, u64)>, u64)>> = img
+    let per_strip: Vec<Result<Vec<(u64, u64, u64)>>> = img
         .par_chunks_mut(strip * w)
         .zip(map_lo.par_chunks_mut(strip * w))
         .zip(map_hi.par_chunks_mut(strip * w))
@@ -658,7 +699,6 @@ pub fn integrate(
                 bufs.push(b);
             }
             let mut counts = vec![(0u64, 0u64, 0u64); n];
-            let mut clamped = 0u64;
             let us: Vec<f64> = (0..w).map(|x| (x as f64 + 0.5) / w as f64 * 2.0 - 1.0).collect();
             let mut drow: Vec<Vec<f32>> = vec![vec![0f32; w]; n];
             let mut vals: Vec<(f32, u16)> = Vec::with_capacity(n);
@@ -683,7 +723,8 @@ pub fn integrate(
                     }
                     let k = yy * w + x;
                     if vals.is_empty() {
-                        o[k] = 0.0;
+                        // No data (`keep_positive` makes it 0).
+                        o[k] = f32::NAN;
                         continue;
                     }
                     let nv = vals.len();
@@ -702,24 +743,19 @@ pub fn integrate(
                         sw += wt;
                         sv += wt * v as f64;
                     }
-                    let mut v = if sw > 0.0 { (sv / sw) as f32 } else { 0.0 };
-                    if !(0.0..=1.0).contains(&v) {
-                        clamped += 1;
-                        v = v.clamp(0.0, 1.0);
-                    }
-                    o[k] = v;
+                    // Unclamped: a faint sky's noise can reach below zero,
+                    // and clamping it there would read as "no data".
+                    o[k] = if sw > 0.0 { (sv / sw) as f32 } else { f32::NAN };
                 }
             }
             progress(Step::Combine { done: combined.fetch_add(1, Ordering::Relaxed) + 1, total: n_strips });
-            Ok((counts, clamped))
+            Ok(counts)
         })
         .collect();
     laps.lap("combined");
     let mut counts = vec![(0u64, 0u64, 0u64); n];
-    let mut clamped = 0u64;
     for r in per_strip {
-        let (c, k) = r?;
-        clamped += k;
+        let c = r?;
         for (t, x) in counts.iter_mut().zip(c) {
             t.0 += x.0;
             t.1 += x.1;
@@ -727,6 +763,7 @@ pub fn integrate(
         }
     }
 
+    let (lift, clamped) = keep_positive(&mut img);
     let scale = measured[reference].scale;
     let mut master = Image::from_data(w, h, img);
     master.adu_scale = scale;
@@ -744,6 +781,9 @@ pub fn integrate(
     set(&mut hdr, "CRUX-WGT", match s.weighting { Weighting::Snr => "snr", Weighting::Exposure => "exposure", Weighting::Equal => "equal" }, "crux weights");
     set(&mut hdr, "CRUX-REJ", &rejection.name(), "crux rejection");
     set(&mut hdr, "CRUX-RJT", &format!("{:.3}", rejected_total * 100.0), "Values rejected, %");
+    if lift > 0.0 {
+        set(&mut hdr, "CRUX-LFT", &format!("{lift:.7}"), "Pedestal added to keep data above 0");
+    }
     write(out, &master, &hdr, None)?;
     let mut rh = Header::default();
     rh.push("IMAGETYP", "Rejection Map", "");
@@ -886,6 +926,25 @@ fn what_ifs(frames: &[FrameReport], sigma: &[f64], w: &[f64], weighting: Weighti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_below_zero_is_lifted_never_left_at_zero() {
+        // A faint sky whose noise reaches below zero, plus pixels without data.
+        let mut rng = 7u64;
+        let mut d: Vec<f32> = (0..200_000)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                0.0004 + ((rng >> 33) as f32 / (1u64 << 31) as f32 - 0.5) * 0.002
+            })
+            .collect();
+        d[..1000].iter_mut().for_each(|v| *v = f32::NAN);
+        let before = d[5000];
+        let (lift, _) = keep_positive(&mut d);
+        assert!(lift > 0.0);
+        assert!(d[..1000].iter().all(|v| *v == 0.0), "no data stays 0");
+        assert!(d[1000..].iter().all(|v| *v >= MIN_DATA), "data never 0");
+        assert!((d[5000] - before - lift).abs() < 1e-7 || d[5000] == MIN_DATA);
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("crux-combine-{}-{name}", std::process::id()));

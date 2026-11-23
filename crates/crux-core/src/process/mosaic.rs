@@ -37,7 +37,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// 2: string keywords were quoted twice (`''RA---TAN''`), so other
 /// programs didn't see the WCS.
-pub const MOSAIC_VERSION: u32 = 2;
+/// 3: data never clamped to 0 (empty) after the lift.
+pub const MOSAIC_VERSION: u32 = 3;
 /// Overlap block size, canvas pixels.
 const BLOCK: usize = 24;
 
@@ -1185,18 +1186,9 @@ fn assemble_xisf(g: &Group, out: &Path, s: &Settings, cat: &Catalog, force: bool
         });
         let noises: Vec<f64> = tiles.iter().map(|t| t.as_ref().map(|t| t.noise).unwrap_or(0.0)).collect();
         drop(tiles);
-        // Keep it positive: lift by the 0.05th percentile if that's below zero.
-        let mut sample: Vec<f32> = mosaic.iter().step_by(97).copied().filter(|v| v.is_finite()).collect();
-        let lo = if sample.is_empty() {
-            0.0
-        } else {
-            let k = sample.len() / 2000;
-            *sample.select_nth_unstable_by(k, |a, b| a.total_cmp(b)).1
-        };
-        let lift = if lo < 1e-4 { 1e-4 - lo } else { 0.0 };
-        for v in mosaic.iter_mut() {
-            *v = if v.is_finite() { (*v + lift).clamp(0.0, 1.0) } else { 0.0 };
-        }
+        // Keep it positive (lifted by the 0.05th percentile if that's below
+        // zero), and never 0 where there's data: 0 means empty.
+        super::combine::keep_positive(&mut mosaic);
 
         let path = output_path(out, &g.target, filter);
         std::fs::create_dir_all(path.parent().unwrap())?;

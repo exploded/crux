@@ -33,7 +33,9 @@ pub const MANIFEST: &str = "crux-process.json";
 pub const PROCESS_VERSION: u32 = 2;
 
 /// Bump when masters change for the same inputs and settings.
-pub const INTEGRATION_VERSION: u32 = 4;
+/// 5: values below zero are lifted, not clamped to 0 ("no data"; M 42
+/// panel 3 S had 4,438 such holes, which the mosaic widened).
+pub const INTEGRATION_VERSION: u32 = 5;
 
 /// Where a master comes from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

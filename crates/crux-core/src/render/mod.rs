@@ -873,6 +873,9 @@ pub struct Neutral {
 /// colour is smoothed over (a fraction of the width).
 const NEUTRAL_DARK: f64 = 0.4;
 const NEUTRAL_SIGMA: f32 = 0.06;
+/// Where the share of dark pixels nearby falls towards this, the sky colour
+/// blends smoothly into the whole picture's.
+const NEUTRAL_PRIOR: f32 = 0.05;
 
 impl Neutral {
     #[inline]
@@ -931,8 +934,14 @@ fn neutral_of(p: &Prepared, r: &Recipe, coef: &palette::Coef, frame: Frame) -> O
         || rayon::join(|| gauss3(&dark, mw, mh, sigma), || gauss3(&masked(&rr), mw, mh, sigma)),
         || rayon::join(|| gauss3(&masked(&gg), mw, mh, sigma), || gauss3(&masked(&bb), mw, mh, sigma)),
     );
-    let mean_of = |b: Vec<f32>| -> Vec<f32> { b.iter().zip(&wsum).map(|(v, w)| if *w > 1.0e-3 { v / w } else { 0.0 }).collect() };
-    let (mr, mg, mb) = (mean_of(br), mean_of(bg), mean_of(bb2));
+    // Far from dark sky (inside a bright nebula) the local mean leans on
+    // the whole picture's dark sky instead: a hard switch there drew the
+    // weight's contour as a sharp-edged patch (M 42's top left).
+    let dark_n: f32 = dark.iter().sum::<f32>().max(1.0);
+    let global = |c: &[f32]| c.iter().zip(&dark).map(|(v, d)| v * d).sum::<f32>() / dark_n;
+    let (gr, gg2, gb) = (global(&rr), global(&gg), global(&bb));
+    let mean_of = |b: Vec<f32>, g: f32| -> Vec<f32> { b.iter().zip(&wsum).map(|(v, w)| (v + NEUTRAL_PRIOR * g) / (w + NEUTRAL_PRIOR)).collect() };
+    let (mr, mg, mb) = (mean_of(br, gr), mean_of(bg, gg2), mean_of(bb2, gb));
     let mut cast = [vec![0f32; n], vec![0f32; n], vec![0f32; n]];
     for i in 0..n {
         let m = (mr[i] + mg[i] + mb[i]) / 3.0;
@@ -1228,7 +1237,8 @@ pub fn auto_crop(p: &Prepared) -> Option<recipe::Crop> {
     if w < 4 || h < 4 {
         return None;
     }
-    let mut valid: Vec<bool> = (0..w * h).map(|i| p.channels.iter().all(|c| c.raw_proxy.data.get(i).is_some_and(|v| *v > 0.0))).collect();
+    let empty: Vec<bool> = (0..w * h).map(|i| !p.channels.iter().all(|c| c.raw_proxy.data.get(i).is_some_and(|v| *v > 0.0))).collect();
+    let mut valid = outside_empty(&empty, w, h).into_iter().map(|e| !e).collect::<Vec<bool>>();
     if let Some(t) = &p.thin {
         for y in 0..h {
             for x in 0..w {
@@ -1252,6 +1262,24 @@ pub fn auto_crop(p: &Prepared) -> Option<recipe::Crop> {
         return None;
     }
     Some(recipe::Crop { left: x0 as f64 / w as f64, top: y0 as f64 / h as f64, right: x1 as f64 / w as f64, bottom: y1 as f64 / h as f64 })
+}
+
+/// The empty pixels joined to the picture's edge through empty pixels: a
+/// stray empty pixel inside (a hole in a master) mustn't cut the crop down
+/// to one side of it.
+fn outside_empty(empty: &[bool], w: usize, h: usize) -> Vec<bool> {
+    let mut out = vec![false; w * h];
+    let mut stack: Vec<usize> = (0..w * h).filter(|&i| (i % w == 0 || i % w == w - 1 || i / w == 0 || i / w == h - 1) && empty[i]).collect();
+    while let Some(i) = stack.pop() {
+        if out[i] {
+            continue;
+        }
+        out[i] = true;
+        let (x, y) = (i % w, i / w);
+        let near = [(x > 0).then(|| i - 1), (x + 1 < w).then(|| i + 1), (y > 0).then(|| i - w), (y + 1 < h).then(|| i + w)];
+        stack.extend(near.into_iter().flatten().filter(|&j| empty[j] && !out[j]));
+    }
+    out
 }
 
 /// Blocks (32 px of the master) whose fine noise is this many times the
@@ -1581,6 +1609,22 @@ pub fn write_png16(path: &Path, rgb: &Rgb, grey: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_edges_reach_in_from_the_border_only() {
+        let (w, h) = (8usize, 6usize);
+        let mut empty = vec![false; w * h];
+        // A ragged left edge two pixels deep on rows 0–2, and a hole inside.
+        for y in 0..3 {
+            empty[y * w] = true;
+            empty[y * w + 1] = true;
+        }
+        empty[3 * w + 5] = true;
+        let out = outside_empty(&empty, w, h);
+        assert!(out[0] && out[w + 1] && out[2 * w + 1], "edge region");
+        assert!(!out[3 * w + 5], "the hole inside isn't an empty edge");
+        assert_eq!(out.iter().filter(|v| **v).count(), 6);
+    }
 
     #[test]
     fn finds_thinly_covered_edges() {
