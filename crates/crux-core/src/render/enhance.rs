@@ -213,18 +213,42 @@ fn model_tags(s: &EnhanceSettings) -> String {
 /// (crux and RC Astro, say) finds each one on disk.
 pub(crate) const KEEP_RESULTS: usize = 3;
 
-/// Mark a reused cache file as just used, so tidying keeps it. Sets the
-/// last-access time only: the modified time is part of the starless and
-/// prepared caches' signatures, so changing it would make them miss.
+/// When each cache file in a folder was last reused: `used.json` there, file
+/// name → nanoseconds since 1970. Not the file's own times: the modified
+/// time is part of the starless and prepared caches' signatures, and the
+/// access time changes whenever anything reads the file (macOS indexing,
+/// virus scanners, crux's own reads).
+pub(crate) const USED_FILE: &str = "used.json";
+
+fn used_map(dir: &Path) -> std::collections::BTreeMap<String, u128> {
+    std::fs::read(dir.join(USED_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn nanos(t: std::time::SystemTime) -> u128 {
+    t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+}
+
+/// Mark a reused cache file as just used, so tidying keeps it.
 pub(crate) fn touch(p: &Path) {
-    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(p) {
-        let _ = f.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()));
+    let (Some(dir), Some(name)) = (p.parent(), p.file_name()) else { return };
+    let mut map = used_map(dir);
+    map.retain(|n, _| dir.join(n).is_file());
+    map.insert(name.to_string_lossy().into_owned(), nanos(std::time::SystemTime::now()));
+    if let Ok(b) = serde_json::to_vec(&map) {
+        let _ = crate::paths::write_atomic(&dir.join(USED_FILE), &b);
     }
 }
 
-/// Of `files`, all but the `keep` most recently used (always keeping `current`).
+/// Of `files` (all in one folder), all but the `keep` most recently used
+/// (always keeping `current`). A file never reused counts from when it was
+/// written.
 pub(crate) fn oldest_beyond(mut files: Vec<PathBuf>, current: &Path, keep: usize) -> Vec<PathBuf> {
-    let used = |p: &PathBuf| std::fs::metadata(p).and_then(|m| m.accessed().or_else(|_| m.modified())).unwrap_or(std::time::UNIX_EPOCH);
+    let map = current.parent().map(used_map).unwrap_or_default();
+    let used = |p: &PathBuf| {
+        let reused = p.file_name().and_then(|n| map.get(&*n.to_string_lossy()).copied()).unwrap_or(0);
+        let written = std::fs::metadata(p).and_then(|m| m.modified()).map(nanos).unwrap_or(0);
+        reused.max(written)
+    };
     files.retain(|p| p != current);
     files.sort_by_key(|p| std::cmp::Reverse(used(p)));
     files.into_iter().skip(keep.saturating_sub(1)).collect()
@@ -416,8 +440,12 @@ mod tests {
         assert_eq!(again.masters[0].path, e.masters[0].path);
         // Reuse leaves the modified time (later caches' signatures) alone.
         assert_eq!(mtime(&again.masters[0].path), before);
-        // Past KEEP_RESULTS, the least recently used goes (here s2's).
+        // Past KEEP_RESULTS, the least recently used goes (here s2's), even
+        // when something else has read it since (macOS indexing does).
         std::thread::sleep(std::time::Duration::from_millis(20));
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&e2.masters[0].path) {
+            let _ = f.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()));
+        }
         for a in [0.2f32, 0.3] {
             apply(&t, &dir, &EnhanceSettings { denoise_amount: a, ..s.clone() }, &|_| {}, &AtomicBool::new(false)).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(20));

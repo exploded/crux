@@ -85,6 +85,7 @@ pub fn apply(t: &Target, out: &Path, progress: &(dyn Fn(usize, usize, f32) + Syn
                 });
                 match slot {
                     Some(i) => per[i].push(e.path()),
+                    None if name.starts_with(super::enhance::USED_FILE) => {}
                     None => {
                         let _ = std::fs::remove_file(e.path());
                     }
