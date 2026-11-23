@@ -299,6 +299,14 @@ impl App {
             shot,
             args,
         };
+        // Open the compute device now (after the user's `[gpu] use`), so the
+        // top bar can say GPU or CPU without waiting for the first job.
+        let c = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = crux_core::config::Config::load(None, None);
+            crux_core::gpu::open();
+            c.request_repaint();
+        });
         if let Some(d) = app.args.dir.clone() {
             app.open(ctx, d);
         }
@@ -717,6 +725,8 @@ impl App {
                     "enh-corner" => self.ui.stack.img.ewhere = 1,
                     // Crop and save stage: trim the empty edges.
                     "img-autocrop" => self.ui.stack.img.pending_autocrop = true,
+                    // Turn the picture a quarter turn clockwise.
+                    "img-turn" => self.ui.stack.img.pending_turn = true,
                     // Milestone 14: mos-run assembles the mosaic; auto-estimate
                     // and auto-run start the Autopilot on Home; watch starts the watcher.
                     "mos-run" => self.ui.stack.mos.pending_run = true,
@@ -1311,8 +1321,33 @@ impl App {
                 if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     self.drawer = !self.drawer;
                 }
+                self.compute_badge(ui);
             });
         });
+    }
+
+    /// GPU or CPU: where the networks, warps and other heavy steps run.
+    /// Click for Settings, where the graphics card can be switched off.
+    fn compute_badge(&mut self, ui: &mut egui::Ui) {
+        use crux_core::gpu::Compute;
+        let p = self.ui.pal;
+        let (label, col, tip) = match crux_core::gpu::compute_now() {
+            Some(Compute::Gpu(name)) => ("GPU", p.good, format!("Using the graphics card: {name}")),
+            Some(Compute::Cpu(why)) => ("CPU", p.muted, format!("Using the CPU: {why}")),
+            None => {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+                ("…", p.faint, "Looking for a graphics card".to_string())
+            }
+        };
+        let g = ui.painter().layout_no_wrap(label.to_string(), semibold(11.5), col);
+        let (r, resp) = ui.allocate_exact_size(Vec2::new(g.size().x + 40.0, 30.0), Sense::click());
+        let pa = ui.painter();
+        pa.rect(r, CornerRadius::same(15), if resp.hovered() { p.panel2 } else { Color32::TRANSPARENT }, Stroke::new(1.0, p.line), StrokeKind::Inside);
+        draw_icon(pa, Icon::Chip, Rect::from_center_size(Pos2::new(r.left() + 17.0, r.center().y), Vec2::splat(16.0)), col);
+        pa.galley(Pos2::new(r.left() + 29.0, r.center().y - g.size().y / 2.0), g, col);
+        if resp.on_hover_text(format!("{tip}. Change it in Settings.")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            self.ui.view = View::Settings;
+        }
     }
 
     fn job_text(&self) -> (String, bool) {
@@ -1531,6 +1566,7 @@ enum Icon {
     Image,
     Settings,
     Keyboard,
+    Chip,
 }
 
 /// The mockup's rail icons, drawn on a 24-unit grid.
@@ -1595,6 +1631,17 @@ fn draw_icon(pa: &egui::Painter, icon: Icon, r: Rect, c: Color32) {
                 pa.circle_filled(pt(x, 10.0), 0.9 * s, c);
             }
             poly(&[(7.0, 14.0), (17.0, 14.0)], false);
+        }
+        Icon::Chip => {
+            // A processor: a square with pins on every side.
+            rect(6.0, 6.0, 12.0, 12.0, 2.0);
+            rect(9.5, 9.5, 5.0, 5.0, 0.5);
+            for k in [9.5, 14.5] {
+                poly(&[(k, 2.5), (k, 6.0)], false);
+                poly(&[(k, 18.0), (k, 21.5)], false);
+                poly(&[(2.5, k), (6.0, k)], false);
+                poly(&[(18.0, k), (21.5, k)], false);
+            }
         }
     }
 }

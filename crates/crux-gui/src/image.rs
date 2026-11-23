@@ -95,6 +95,8 @@ pub struct ImageUi {
     crop_note: Option<String>,
     /// Harness: trim the empty edges once the masters are read.
     pub pending_autocrop: bool,
+    /// Harness: turn the picture right once the recipe is loaded.
+    pub pending_turn: bool,
     /// What the background preparation is doing (enhance progress).
     pub progress: Option<String>,
     /// Sharpen and denoise stage: before and after crops, their key, the
@@ -198,6 +200,7 @@ impl Default for ImageUi {
             crop_ratio: None,
             crop_note: None,
             pending_autocrop: false,
+            pending_turn: false,
             progress: None,
             enh_view: None,
             enh_pending: None,
@@ -404,12 +407,12 @@ fn unfinished(r: &Recipe) -> Recipe {
     u
 }
 
-/// Keep targets, recipe, prepared channels and the preview up to date.
-/// Called every frame while an image stage is shown.
-pub fn tick(a: &mut UiState, s: &Session, tx: &Sender<Msg>, ctx: &egui::Context) {
+/// Keep the targets and the recipe up to date (cheap: JSON, TOML and file
+/// times). Called on every Stack stage, since the image steps in the step
+/// list need them even while a stacking step is shown.
+pub fn load(a: &mut UiState, s: &Session) {
     let Some(plan) = &a.stack.plan else { return };
     let out = plan.out.clone();
-    let st = a.stack.stage;
     let img = &mut a.stack.img;
     img.fits = s.cfg.process.fits;
     let tk = format!("{}|{}|{}", out.display(), a.stack.integrations.len(), a.stack.mos.generation);
@@ -440,7 +443,18 @@ pub fn tick(a: &mut UiState, s: &Session, tx: &Sender<Msg>, ctx: &egui::Context)
         img.base = Some((r.clone(), label));
         img.recipe = Some(r);
     }
-    let r = img.recipe.clone().unwrap();
+}
+
+/// Keep prepared channels and the preview up to date (after [`load`]).
+/// Called every frame while an image stage is shown.
+pub fn tick(a: &mut UiState, s: &Session, tx: &Sender<Msg>, ctx: &egui::Context) {
+    load(a, s);
+    let Some(plan) = &a.stack.plan else { return };
+    let out = plan.out.clone();
+    let st = a.stack.stage;
+    let img = &mut a.stack.img;
+    let Some(t) = img.target().cloned() else { return };
+    let Some(r) = img.recipe.clone() else { return };
     // Read and correct the masters in the background.
     let want = want_key(&t, &r);
     if want != img.prep_key && img.preparing.is_none() {
@@ -503,7 +517,13 @@ pub fn tick(a: &mut UiState, s: &Session, tx: &Sender<Msg>, ctx: &egui::Context)
     }
     if std::mem::take(&mut img.pending_autocrop) {
         let rr = img.recipe.as_mut().unwrap();
-        rr.crop = render::auto_crop(&p);
+        rr.crop = render::auto_crop(&p).map(|c| c.turned(rr.rotate));
+    }
+    if std::mem::take(&mut img.pending_turn) {
+        let rr = img.recipe.as_mut().unwrap();
+        rr.rotate = (rr.rotate + 1) % 4;
+        rr.crop = rr.crop.map(|c| c.turned(1));
+        img.written = None;
     }
     let r = img.recipe.clone().unwrap();
     // The preview (the crop doesn't change it: the Crop stage draws the box).
@@ -561,7 +581,7 @@ pub fn tick(a: &mut UiState, s: &Session, tx: &Sender<Msg>, ctx: &egui::Context)
                     }
                 }
                 Stage::Crop => {
-                    let f = render::render_proxy(&p, &r);
+                    let f = render::render_proxy(&p, &r).rotated(r.rotate);
                     (f.clone(), f, (String::new(), String::new()))
                 }
                 _ => (render::render_proxy(&p, &kept(&unfinished(&r))), render::render_proxy(&p, &kept(&r)), ("Before finishing".to_string(), "Finished".to_string())),
@@ -686,7 +706,8 @@ pub fn summary(a: &UiState, st: Stage) -> (Color32, String) {
                     let d = pp.channels.iter().find_map(|c| c.report.as_ref().map(|g| g.degree)).unwrap_or(0);
                     (dot, format!("{}, degree {d}: {} removed", if r.gradient.degree == 0 { "Auto" } else { "Fixed" }, parts.join(", ")))
                 }
-                None => (dot, "Measuring…".into()),
+                None if img.preparing.is_some() => (dot, "Measuring…".into()),
+                None => (dot, if r.gradient.degree == 0 { "Auto degree".into() } else { format!("Degree {}", r.gradient.degree) }),
             }
         }
         Stage::Palette => (dot, format!("{}, background {:.2}", if r.mix.preset.is_empty() { "Custom mix" } else { &r.mix.preset }, r.stretch.background)),
@@ -704,14 +725,18 @@ pub fn summary(a: &UiState, st: Stage) -> (Color32, String) {
             }
         }
         Stage::Crop => {
-            let shape = match (&r.crop, &img.prepared) {
+            let mut shape = match (&r.crop, &img.prepared) {
                 (Some(c), Some(pp)) if !c.is_whole() => {
-                    let (_, _, w, h) = c.pixels(pp.width, pp.height);
+                    let (fw, fh) = turned_size(pp.width, pp.height, r.rotate);
+                    let (_, _, w, h) = c.pixels(fw, fh);
                     format!("Cropped to {w} × {h} px")
                 }
                 (Some(c), None) if !c.is_whole() => "Cropped".to_string(),
                 _ => "Whole picture".to_string(),
             };
+            if r.rotate % 4 != 0 {
+                shape = format!("{shape}, {}", turn_name(r.rotate));
+            }
             match &img.written {
                 Some(Ok(wr)) => (p.good, format!("Saved {}", wr.jpg.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())),
                 _ => (if img.writing { p.warn } else { p.faint }, format!("{shape}; not saved yet")),
@@ -905,8 +930,8 @@ fn crop_view(ui: &mut Ui, a: &mut UiState, p: &Pal) {
     let (outer, _) = ui.allocate_exact_size(Vec2::new(wd, ih + 20.0), Sense::hover());
     ui.painter().rect_filled(outer, 10.0, p.well);
     let r = Rect::from_center_size(outer.center(), Vec2::new(iw, ih));
-    let (fw, fh) = img.prepared.as_ref().map(|pp| (pp.width as f64, pp.height as f64)).unwrap_or((tw as f64, th as f64));
     let Some(recipe) = img.recipe.as_mut() else { return };
+    let (fw, fh) = img.prepared.as_ref().map(|pp| turned_size(pp.width, pp.height, recipe.rotate)).map(|(w, h)| (w as f64, h as f64)).unwrap_or((tw as f64, th as f64));
     let cur = recipe.crop.unwrap_or(recipe::Crop::WHOLE).clamped();
     let frac = |pos: Pos2| (((pos.x - r.left()) / r.width()) as f64, ((pos.y - r.top()) / r.height()) as f64);
     let cr = Rect::from_min_max(
@@ -998,6 +1023,20 @@ fn crop_view(ui: &mut Ui, a: &mut UiState, p: &Pal) {
     };
     pa.rect_filled(lr, 4.0, Color32::from_black_alpha(140));
     pa.galley(lr.min + Vec2::new(6.0, 2.0), g, Color32::WHITE);
+}
+
+/// A `w` × `h` picture's size after `q` quarter turns.
+fn turned_size(w: usize, h: usize, q: u8) -> (usize, usize) {
+    if q % 2 == 1 { (h, w) } else { (w, h) }
+}
+
+fn turn_name(q: u8) -> &'static str {
+    match q % 4 {
+        1 => "turned 90° right",
+        2 => "turned 180°",
+        3 => "turned 90° left",
+        _ => "not turned",
+    }
 }
 
 /// The crop after dragging grip `g` from `s0` to `q` (fractions), held to
@@ -1724,8 +1763,23 @@ fn settings(ui: &mut Ui, a: &mut UiState, p: &Pal) {
             }
         }
         Stage::Crop => {
-            w::muted(ui, p, "Drag the box's edges or corners to resize it, drag inside it to move it, or drag outside it to draw a new one. The crop applies to the full-size image; the other stages show the whole picture. It's kept with this target's recipe, not in saved recipes.");
-            let (fw, fh) = pp.as_ref().map(|x| (x.width as f64, x.height as f64)).unwrap_or((1.0, 1.0));
+            w::muted(ui, p, "Drag the box's edges or corners to resize it, drag inside it to move it, or drag outside it to draw a new one. The crop and turn apply to the full-size image; the other stages show the whole picture. They're kept with this target's recipe, not in saved recipes.");
+            ui.horizontal_wrapped(|ui| {
+                ui.add_sized([150.0, 20.0], egui::Label::new(RichText::new("Turn").font(body(13.0))));
+                for (label, q, tip) in [("Turn left", 3u8, "Turn the picture 90° anticlockwise"), ("Turn right", 1u8, "Turn the picture 90° clockwise")] {
+                    if w::button(ui, p, label, Kind::Normal, None).on_hover_text(tip).clicked() {
+                        r.rotate = (r.rotate + q) % 4;
+                        // The box turns with the picture, and so does a fixed shape.
+                        r.crop = r.crop.map(|c| c.turned(q));
+                        img.crop_ratio = img.crop_ratio.map(|x| 1.0 / x);
+                        img.written = None;
+                    }
+                }
+                if r.rotate % 4 != 0 {
+                    ui.label(RichText::new(turn_name(r.rotate)).font(body(12.5)).color(p.muted));
+                }
+            });
+            let (fw, fh) = pp.as_ref().map(|x| turned_size(x.width, x.height, r.rotate)).map(|(w, h)| (w as f64, h as f64)).unwrap_or((1.0, 1.0));
             let cur = r.crop.unwrap_or(recipe::Crop::WHOLE);
             ui.horizontal_wrapped(|ui| {
                 ui.add_sized([150.0, 20.0], egui::Label::new(RichText::new("Shape").font(body(13.0))));
@@ -1744,7 +1798,7 @@ fn settings(ui: &mut Ui, a: &mut UiState, p: &Pal) {
             ui.horizontal_wrapped(|ui| {
                 ui.add_sized([150.0, 20.0], egui::Label::new(""));
                 if w::button_enabled(ui, p, "Trim empty edges", Kind::Normal, None, pp.is_some()).on_hover_text("The largest box with data in every channel: removes the black edges a mosaic or registration leaves.").clicked() {
-                    match pp.as_ref().and_then(|x| render::auto_crop(x)) {
+                    match pp.as_ref().and_then(|x| render::auto_crop(x)).map(|c| c.turned(r.rotate)) {
                         Some(c) => {
                             r.crop = Some(match img.crop_ratio {
                                 Some(a) => fit_inside(c, a, fw, fh),
@@ -1835,8 +1889,9 @@ fn recipe_card(ui: &mut Ui, a: &mut UiState, p: &Pal) {
     });
     if let Some(mut x) = load {
         x.fit_to(&names);
-        // The crop belongs to the target, not the recipe.
+        // The crop and turn belong to the target, not the recipe.
         x.crop = img.recipe.as_ref().and_then(|r| r.crop);
+        x.rotate = img.recipe.as_ref().map(|r| r.rotate).unwrap_or(0);
         let label = if x.name.is_empty() || saved.iter().all(|(n, _)| n != &x.name) { "default".to_string() } else { format!("recipe “{}”", x.name) };
         img.base = Some((x.clone(), label));
         img.recipe = Some(x);

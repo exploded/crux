@@ -602,6 +602,35 @@ impl Rgb {
         Rgb { width: w, height: h, r: cut(&self.r), g: cut(&self.g), b: cut(&self.b) }
     }
 
+    /// Turned `q` quarter turns clockwise.
+    pub fn rotated(self, q: u8) -> Rgb {
+        use rayon::prelude::*;
+        let q = q % 4;
+        if q == 0 {
+            return self;
+        }
+        let (w, h) = (self.width, self.height);
+        let (nw, nh) = if q == 2 { (w, h) } else { (h, w) };
+        // Source pixel for output (x, y).
+        let src = move |x: usize, y: usize| -> usize {
+            match q {
+                1 => (h - 1 - x) * w + y,
+                2 => (h - 1 - y) * w + (w - 1 - x),
+                _ => x * w + (w - 1 - y),
+            }
+        };
+        let turn = |s: &[f32]| -> Vec<f32> {
+            let mut d = vec![0.0f32; nw * nh];
+            d.par_chunks_mut(nw.max(1)).enumerate().for_each(|(y, row)| {
+                for (x, v) in row.iter_mut().enumerate() {
+                    *v = s[src(x, y)];
+                }
+            });
+            d
+        };
+        Rgb { width: nw, height: nh, r: turn(&self.r), g: turn(&self.g), b: turn(&self.b) }
+    }
+
     /// 8-bit RGBA, for the GUI.
     pub fn rgba8(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(self.r.len() * 4);
@@ -1170,11 +1199,15 @@ pub fn render_full(p: &Prepared, r: &Recipe) -> Result<Rgb> {
     laps.lap("coefficients and split");
     let rgb = render_planes(&planes, bare.as_deref(), p.width, p.height, &coef, col.as_ref().zip(p.paint_full.as_ref()), split.as_ref());
     laps.lap("planes");
+    // The crop is in the turned picture: cut first (turned back), then turn
+    // the smaller result.
+    let q = r.rotate % 4;
     let rgb = match &r.crop {
-        Some(c) if !c.is_whole() => rgb.cropped(c),
+        Some(c) if !c.is_whole() => rgb.cropped(&c.turned(4 - q)),
         _ => rgb,
     };
-    laps.lap("crop");
+    let rgb = rgb.rotated(q);
+    laps.lap("crop and turn");
     Ok(rgb)
 }
 
@@ -1609,6 +1642,17 @@ mod tests {
         assert_eq!((c.width, c.height), (200, 150));
         assert_eq!(c.r[0], full.r[100]);
         assert_eq!(c.r[200 + 7], full.r[w + 100 + 7]);
+        // Turned right, the same crop in the turned picture: the full
+        // picture's left half, top half, turned.
+        let mut rt = rc.clone();
+        rt.rotate = 1;
+        rt.crop = rc.crop.map(|k| k.turned(1));
+        let t = render_full(&p, &rt).unwrap();
+        assert_eq!((t.width, t.height), (150, 200));
+        // Turned clockwise: the cropped picture's bottom-left pixel is now top left.
+        assert_eq!(t.r[0], c.r[(c.height - 1) * c.width]);
+        assert_eq!(t.r[t.width - 1], c.r[0]);
+        assert_eq!(c.clone().rotated(2).rotated(2).r, c.r);
         // No empty edges: nothing to trim.
         assert_eq!(auto_crop(&p), None);
         let _ = std::fs::remove_dir_all(&dir);

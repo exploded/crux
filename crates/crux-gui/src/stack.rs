@@ -665,8 +665,12 @@ pub fn view(ui: &mut Ui, a: &mut UiState, s: &mut Session, tx: &Sender<Msg>) {
     crate::mosaic::tick(a, s, tx, ui.ctx());
     if a.stack.stage.is_image() {
         crate::image::tick(a, s, tx, ui.ctx());
-    } else if a.stack.stage != Stage::Mosaic {
-        want_preview(a, s, tx, ui.ctx());
+    } else {
+        // The step list's image steps need the targets and recipe.
+        crate::image::load(a, s);
+        if a.stack.stage != Stage::Mosaic {
+            want_preview(a, s, tx, ui.ctx());
+        }
     }
     // Bound by what's visible: a wide row must never widen the page.
     let vis = ui.available_width();

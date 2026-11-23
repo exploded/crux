@@ -34,6 +34,14 @@ pub struct Recipe {
     /// its `recipe.toml`, left out of saved recipes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub crop: Option<Crop>,
+    /// Quarter turns clockwise (0–3), applied with the crop; the crop is
+    /// in the turned picture. Belongs to the target like the crop.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub rotate: u8,
+}
+
+fn is_zero(v: &u8) -> bool {
+    *v == 0
 }
 
 /// A crop as fractions of the full picture (0 = left or top edge, 1 =
@@ -60,6 +68,11 @@ impl Crop {
         self.left <= 1e-6 && self.top <= 1e-6 && self.right >= 1.0 - 1e-6 && self.bottom >= 1.0 - 1e-6
     }
 
+    /// The same box once the picture is turned `q` quarter turns clockwise.
+    pub fn turned(self, q: u8) -> Crop {
+        (0..q % 4).fold(self, |c, _| Crop { left: 1.0 - c.bottom, top: c.left, right: 1.0 - c.top, bottom: c.right })
+    }
+
     /// Pixel rectangle in a `w` × `h` picture: x, y, width, height.
     pub fn pixels(&self, w: usize, h: usize) -> (usize, usize, usize, usize) {
         let c = self.clamped();
@@ -73,7 +86,7 @@ impl Crop {
 
 impl Default for Recipe {
     fn default() -> Self {
-        Recipe { name: String::new(), version: RECIPE_VERSION, gradient: GradientSettings::default(), mix: Mix::default(), stretch: Stretching::default(), finish: Finishing::default(), enhance: Default::default(), stars: StarSettings::default(), crop: None }
+        Recipe { name: String::new(), version: RECIPE_VERSION, gradient: GradientSettings::default(), mix: Mix::default(), stretch: Stretching::default(), finish: Finishing::default(), enhance: Default::default(), stars: StarSettings::default(), crop: None, rotate: 0 }
     }
 }
 
@@ -187,13 +200,14 @@ pub fn find(name_or_path: &str) -> Result<Recipe> {
         .unwrap_or_else(|| anyhow::bail!("no recipe named {name_or_path:?} (saved recipes: {})", list().iter().map(|x| x.0.clone()).collect::<Vec<_>>().join(", ")))
 }
 
-/// Save under its name in the recipes folder (without the crop, which
-/// belongs to one target).
+/// Save under its name in the recipes folder (without the crop and
+/// rotation, which belong to one target).
 pub fn save_named(r: &Recipe) -> Result<PathBuf> {
     let d = dir().ok_or_else(|| anyhow::anyhow!("no settings folder"))?;
     let p = d.join(format!("{}.toml", r.slug()));
     let mut r = r.clone();
     r.crop = None;
+    r.rotate = 0;
     r.save(&p)?;
     Ok(p)
 }
@@ -224,5 +238,13 @@ mod tests {
         assert_eq!(Recipe::from_toml(&r.to_toml()).unwrap().crop, r.crop);
         assert_eq!(r.crop.unwrap().pixels(1000, 500), (100, 25, 800, 475));
         assert!(Crop::WHOLE.is_whole());
+        // Turning: a box at the top left goes to the top right; four turns
+        // bring it back.
+        let c = Crop { left: 0.0, top: 0.0, right: 0.5, bottom: 0.25 };
+        assert_eq!(c.turned(1), Crop { left: 0.75, top: 0.0, right: 1.0, bottom: 0.5 });
+        assert_eq!(c.turned(4), c);
+        assert_eq!(c.turned(1).turned(3), c);
+        r.rotate = 3;
+        assert_eq!(Recipe::from_toml(&r.to_toml()).unwrap().rotate, 3);
     }
 }

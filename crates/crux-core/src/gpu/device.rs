@@ -65,6 +65,11 @@ pub(super) fn status() -> Result<&'static Gpu, String> {
     DEV.get_or_init(open).as_ref().map_err(|e| e.clone())
 }
 
+/// Like [`status`], without opening the device: `None` until it's open.
+pub(super) fn status_now() -> Option<Result<&'static Gpu, String>> {
+    DEV.get().map(|r| r.as_ref().map_err(|e| e.clone()))
+}
+
 /// The device when crux may use it, else `None` (use the CPU).
 pub fn get() -> Option<&'static Gpu> {
     if !super::wanted() {

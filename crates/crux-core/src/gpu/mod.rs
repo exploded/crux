@@ -56,28 +56,65 @@ pub fn fail(why: &str) {
     }
 }
 
-/// What crux will use, for Settings and `crux config`: "NVIDIA GeForce RTX
-/// 3070 (Vulkan)", or why it uses the CPU.
-pub fn describe() -> String {
+/// Where crux computes: the graphics card's name ("NVIDIA GeForce RTX 3070
+/// (Vulkan)"), or why it uses the CPU.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Compute {
+    Gpu(String),
+    Cpu(String),
+}
+
+/// Where crux computes, opening the device if it isn't open yet.
+pub fn compute() -> Compute {
+    compute_with(true).expect("waited for the device")
+}
+
+/// Where crux computes, without waiting: `None` while the device hasn't
+/// been opened yet ([`open`] opens it).
+pub fn compute_now() -> Option<Compute> {
+    compute_with(false)
+}
+
+fn compute_with(wait: bool) -> Option<Compute> {
     if !cfg!(feature = "gpu") {
-        return "CPU (this build has no GPU support)".into();
+        return Some(Compute::Cpu("this build has no GPU support".into()));
     }
     if let Some(why) = FAILED.lock().ok().and_then(|f| f.clone()) {
-        return format!("CPU (the graphics card failed: {why})");
+        return Some(Compute::Cpu(format!("the graphics card failed: {why}")));
     }
     if !wanted() {
-        return "CPU (the graphics card is switched off)".into();
+        return Some(Compute::Cpu("the graphics card is switched off".into()));
     }
     #[cfg(feature = "gpu")]
     {
-        match device::status() {
-            Ok(g) => g.describe(),
-            Err(why) => format!("CPU ({why})"),
-        }
+        let st = if wait { Some(device::status()) } else { device::status_now() };
+        st.map(|s| match s {
+            Ok(g) => Compute::Gpu(g.describe()),
+            Err(why) => Compute::Cpu(why),
+        })
     }
     #[cfg(not(feature = "gpu"))]
     {
+        let _ = wait;
         unreachable!()
+    }
+}
+
+/// Open the device now when crux may use it (blocks; the GUI calls it on a
+/// thread at start so [`compute_now`] has an answer).
+pub fn open() {
+    #[cfg(feature = "gpu")]
+    if wanted() {
+        let _ = device::status();
+    }
+}
+
+/// What crux will use, for Settings and `crux config`: "NVIDIA GeForce RTX
+/// 3070 (Vulkan)", or "CPU (why)".
+pub fn describe() -> String {
+    match compute() {
+        Compute::Gpu(name) => name,
+        Compute::Cpu(why) => format!("CPU ({why})"),
     }
 }
 
