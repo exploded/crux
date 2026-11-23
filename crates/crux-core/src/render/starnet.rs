@@ -52,7 +52,9 @@ pub fn apply(t: &Target, out: &Path, progress: &(dyn Fn(usize, usize, f32) + Syn
                 .unwrap_or((0, 0));
             let mh = hex(&format!("{}:{size}:{mtime}", crate::paths::key(&m.path)));
             let file = dir.join(format!("{}_{mh}_{tag}.xisf", crate::process::job::safe_name(&m.channel)));
-            if !file.is_file() {
+            if file.is_file() {
+                super::enhance::touch(&file);
+            } else {
                 let laps = crate::timing::Laps::new(format!("starless {}", m.channel));
                 let img = crate::read_image(&m.path)?;
                 laps.lap("read");
@@ -65,14 +67,32 @@ pub fn apply(t: &Target, out: &Path, progress: &(dyn Fn(usize, usize, f32) + Syn
                 std::fs::rename(&tmp, &file)?;
                 laps.lap("network and write");
             }
-            keep.push(file.clone());
+            keep.push((crate::process::job::safe_name(&m.channel), file.clone()));
             res.masters[i].starless = Some(file);
         }
-        // Starless files of masters this target no longer has.
+        // Per channel, the most recently used few (the masters of other
+        // enhance settings, so switching back finds them); everything else
+        // (other channels, an older network, leftovers) goes.
         if let Ok(rd) = std::fs::read_dir(&dir) {
+            let mut per: Vec<Vec<std::path::PathBuf>> = vec![Vec::new(); keep.len()];
             for e in rd.flatten() {
-                if !keep.contains(&e.path()) {
-                    let _ = std::fs::remove_file(e.path());
+                let name = e.file_name().to_string_lossy().to_string();
+                // `<channel>_<16 hex>_<tag>.xisf` for this channel exactly.
+                let slot = keep.iter().position(|(ch, _)| {
+                    name.strip_prefix(&format!("{ch}_"))
+                        .and_then(|r| r.strip_suffix(&format!("_{tag}.xisf")))
+                        .is_some_and(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+                });
+                match slot {
+                    Some(i) => per[i].push(e.path()),
+                    None => {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+            for (files, (_, current)) in per.into_iter().zip(&keep) {
+                for p in super::enhance::oldest_beyond(files, current, super::enhance::KEEP_RESULTS) {
+                    let _ = std::fs::remove_file(p);
                 }
             }
         }

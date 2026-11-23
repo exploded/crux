@@ -93,6 +93,9 @@ pub struct ImageUi {
     crop_shape: usize,
     crop_ratio: Option<f64>,
     crop_note: Option<String>,
+    /// The prepared target's empty edges trimmed (`render::auto_crop`,
+    /// unturned): the crop when the recipe sets none.
+    auto_crop: Option<recipe::Crop>,
     /// Harness: trim the empty edges once the masters are read.
     pub pending_autocrop: bool,
     /// Harness: turn the picture right once the recipe is loaded.
@@ -199,6 +202,7 @@ impl Default for ImageUi {
             crop_shape: 0,
             crop_ratio: None,
             crop_note: None,
+            auto_crop: None,
             pending_autocrop: false,
             pending_turn: false,
             progress: None,
@@ -251,6 +255,7 @@ impl ImageUi {
                 self.prep_key = key;
                 match r {
                     Ok(p) => {
+                        self.auto_crop = render::auto_crop(&p);
                         self.prepared = Some(p);
                         self.error = None;
                     }
@@ -321,6 +326,12 @@ fn output_of(img: &ImageUi, out: &std::path::Path) -> Option<(PathBuf, String)> 
     let t = img.target()?;
     let r = img.recipe.as_ref()?;
     Some((t.image_dir(out), render::base_name(&t.object, &named(r))))
+}
+
+/// The crop in effect, in the turned picture (as `render::crop_of`): the
+/// recipe's own, or the empty edges trimmed when it sets none.
+fn crop_now(auto: Option<recipe::Crop>, r: &Recipe) -> Option<recipe::Crop> {
+    r.crop.or_else(|| auto.map(|c| c.turned(r.rotate % 4)))
 }
 
 fn want_key(t: &Target, r: &Recipe) -> String {
@@ -725,7 +736,7 @@ pub fn summary(a: &UiState, st: Stage) -> (Color32, String) {
             }
         }
         Stage::Crop => {
-            let mut shape = match (&r.crop, &img.prepared) {
+            let mut shape = match (&crop_now(img.auto_crop, r), &img.prepared) {
                 (Some(c), Some(pp)) if !c.is_whole() => {
                     let (fw, fh) = turned_size(pp.width, pp.height, r.rotate);
                     let (_, _, w, h) = c.pixels(fw, fh);
@@ -930,9 +941,10 @@ fn crop_view(ui: &mut Ui, a: &mut UiState, p: &Pal) {
     let (outer, _) = ui.allocate_exact_size(Vec2::new(wd, ih + 20.0), Sense::hover());
     ui.painter().rect_filled(outer, 10.0, p.well);
     let r = Rect::from_center_size(outer.center(), Vec2::new(iw, ih));
+    let auto = img.auto_crop;
     let Some(recipe) = img.recipe.as_mut() else { return };
     let (fw, fh) = img.prepared.as_ref().map(|pp| turned_size(pp.width, pp.height, recipe.rotate)).map(|(w, h)| (w as f64, h as f64)).unwrap_or((tw as f64, th as f64));
-    let cur = recipe.crop.unwrap_or(recipe::Crop::WHOLE).clamped();
+    let cur = crop_now(auto, recipe).unwrap_or(recipe::Crop::WHOLE).clamped();
     let frac = |pos: Pos2| (((pos.x - r.left()) / r.width()) as f64, ((pos.y - r.top()) / r.height()) as f64);
     let cr = Rect::from_min_max(
         Pos2::new(r.left() + cur.left as f32 * r.width(), r.top() + cur.top as f32 * r.height()),
@@ -1429,7 +1441,7 @@ fn enhance_view(ui: &mut Ui, a: &mut UiState, p: &Pal) {
 fn enhance_settings(ui: &mut Ui, img: &mut ImageUi, p: &Pal, r: &mut Recipe, base: &Recipe, base_label: &str, depth: Depth) {
     use render::enhance::{availability, Engine, Sharpen};
     let avail = img.enh_avail.get_or_insert_with(|| [(availability(Engine::Crux, false), availability(Engine::Crux, true)), (availability(Engine::RcAstro, false), availability(Engine::RcAstro, true))]).clone();
-    w::muted(ui, p, "Runs on each linear master before gradient removal. crux's own networks do it by default: a denoiser trained on pairs of stacks of your subs, and a star corrector trained on the centres of your sharpest masters. Each master is processed once and kept, so moving a slider only blends.");
+    w::muted(ui, p, "Sharpens stars and removes noise from each master, before gradient removal.");
     let e = &mut r.enhance;
     let be = &base.enhance;
     // Who does it.
@@ -1780,7 +1792,7 @@ fn settings(ui: &mut Ui, a: &mut UiState, p: &Pal) {
                 }
             });
             let (fw, fh) = pp.as_ref().map(|x| turned_size(x.width, x.height, r.rotate)).map(|(w, h)| (w as f64, h as f64)).unwrap_or((1.0, 1.0));
-            let cur = r.crop.unwrap_or(recipe::Crop::WHOLE);
+            let cur = crop_now(img.auto_crop, &r).unwrap_or(recipe::Crop::WHOLE);
             ui.horizontal_wrapped(|ui| {
                 ui.add_sized([150.0, 20.0], egui::Label::new(RichText::new("Shape").font(body(13.0))));
                 for (i, (name, ratio)) in SHAPES.iter().enumerate() {
@@ -1797,20 +1809,21 @@ fn settings(ui: &mut Ui, a: &mut UiState, p: &Pal) {
             });
             ui.horizontal_wrapped(|ui| {
                 ui.add_sized([150.0, 20.0], egui::Label::new(""));
-                if w::button_enabled(ui, p, "Trim empty edges", Kind::Normal, None, pp.is_some()).on_hover_text("The largest box with data in every channel: removes the black edges a mosaic or registration leaves.").clicked() {
-                    match pp.as_ref().and_then(|x| render::auto_crop(x)).map(|c| c.turned(r.rotate)) {
+                if w::button_enabled(ui, p, "Trim empty edges", Kind::Normal, None, pp.is_some()).on_hover_text("The default: the largest box with data in every channel, which removes the black edges a mosaic or registration leaves.").clicked() {
+                    match img.auto_crop.map(|c| c.turned(r.rotate)) {
                         Some(c) => {
-                            r.crop = Some(match img.crop_ratio {
-                                Some(a) => fit_inside(c, a, fw, fh),
-                                None => c,
-                            });
+                            // Without a fixed shape, follow the data (None).
+                            r.crop = img.crop_ratio.map(|a| fit_inside(c, a, fw, fh));
                             img.crop_note = None;
                         }
-                        None => img.crop_note = Some("No empty edges to trim: every channel has data to the edge.".into()),
+                        None => {
+                            r.crop = None;
+                            img.crop_note = Some("No empty edges to trim: every channel has data to the edge.".into());
+                        }
                     }
                 }
                 if w::button(ui, p, "Whole picture", Kind::Ghost, None).clicked() {
-                    r.crop = None;
+                    r.crop = Some(recipe::Crop::WHOLE);
                     img.crop_shape = 0;
                     img.crop_ratio = None;
                     img.crop_note = None;
@@ -1820,8 +1833,9 @@ fn settings(ui: &mut Ui, a: &mut UiState, p: &Pal) {
                 ui.label(RichText::new(n).font(body(12.5)).color(p.muted));
             }
             if pp.is_some() {
-                let (x, y, w, h) = r.crop.unwrap_or(recipe::Crop::WHOLE).pixels(fw as usize, fh as usize);
-                let t = if r.crop.is_none_or(|c| c.is_whole()) { format!("Keeps the whole picture, {w} × {h} px.") } else { format!("Keeps {w} × {h} px of {} × {}, from x {x}, y {y}.", fw as usize, fh as usize) };
+                let now = crop_now(img.auto_crop, &r);
+                let (x, y, w, h) = now.unwrap_or(recipe::Crop::WHOLE).pixels(fw as usize, fh as usize);
+                let t = if now.is_none_or(|c| c.is_whole()) { format!("Keeps the whole picture, {w} × {h} px.") } else { format!("Keeps {w} × {h} px of {} × {}, from x {x}, y {y}.", fw as usize, fh as usize) };
                 ui.label(RichText::new(t).font(body(12.5)).color(p.muted));
             }
         }

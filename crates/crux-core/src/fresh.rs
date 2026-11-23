@@ -208,7 +208,8 @@ fn image_dirs(d: &Path) -> Vec<PathBuf> {
 fn intermediates_of(d: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = ["registered", "calibrated"].iter().map(|n| d.join(n)).filter(|p| p.exists()).collect();
     for t in image_dirs(d) {
-        v.extend(["enhanced", "starless", "prepared.cache"].iter().map(|n| t.join(n)).filter(|p| p.exists()));
+        v.extend(["enhanced", "starless"].iter().map(|n| t.join(n)).filter(|p| p.exists()));
+        v.extend(crate::render::prepcache::slots(&t.join("prepared.cache")).into_iter().filter(|p| p.exists()));
     }
     v
 }

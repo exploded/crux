@@ -178,7 +178,9 @@ pub fn apply(t: &Target, out: &Path, s: &EnhanceSettings, progress: &(dyn Fn(Pro
         let tags = model_tags(s);
         let fin = dir.join(format!("{ch}_{mh}_final-{}.xisf", hex(&format!("{}|{tags}", serde_json::to_string(s).unwrap_or_default()))));
         let p = |step: &str, done: f32| progress(Progress { master: i, masters: n, channel: m.channel.clone(), step: step.into(), done });
-        if !fin.is_file() {
+        if fin.is_file() {
+            touch(&fin);
+        } else {
             match s.engine {
                 Engine::Crux => crux_engine(&m.path, &dir, &ch, &mh, s, &fin, &p, cancel)?,
                 Engine::RcAstro => rc_engine(&m.path, s, &fin, &p, cancel)?,
@@ -207,18 +209,43 @@ fn model_tags(s: &EnhanceSettings) -> String {
     }
 }
 
+/// How many results per channel are kept: switching between a few settings
+/// (crux and RC Astro, say) finds each one on disk.
+pub(crate) const KEEP_RESULTS: usize = 3;
+
+/// Mark a reused cache file as just used, so tidying keeps it. Sets the
+/// last-access time only: the modified time is part of the starless and
+/// prepared caches' signatures, so changing it would make them miss.
+pub(crate) fn touch(p: &Path) {
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(p) {
+        let _ = f.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()));
+    }
+}
+
+/// Of `files`, all but the `keep` most recently used (always keeping `current`).
+pub(crate) fn oldest_beyond(mut files: Vec<PathBuf>, current: &Path, keep: usize) -> Vec<PathBuf> {
+    let used = |p: &PathBuf| std::fs::metadata(p).and_then(|m| m.accessed().or_else(|_| m.modified())).unwrap_or(std::time::UNIX_EPOCH);
+    files.retain(|p| p != current);
+    files.sort_by_key(|p| std::cmp::Reverse(used(p)));
+    files.into_iter().skip(keep.saturating_sub(1)).collect()
+}
+
 /// Remove this channel's files from other masters (an older master or a
-/// replaced file) and finals other than `keep`.
-fn tidy(dir: &Path, ch: &str, mh: &str, keep: &Path) {
+/// replaced file), and finals beyond the most recently used few.
+fn tidy(dir: &Path, ch: &str, mh: &str, current: &Path) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut finals = Vec::new();
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
         let Some(rest) = name.strip_prefix(&format!("{ch}_")) else { continue };
-        let other_master = !rest.starts_with(mh);
-        let other_final = rest.contains("_final-") && e.path() != keep;
-        if other_master || other_final {
+        if !rest.starts_with(mh) || rest.ends_with(".tmp") {
             let _ = std::fs::remove_file(e.path());
+        } else if rest.contains("_final-") && rest.ends_with(".xisf") {
+            finals.push(e.path());
         }
+    }
+    for p in oldest_beyond(finals, current, KEEP_RESULTS) {
+        let _ = std::fs::remove_file(p);
     }
 }
 
@@ -380,9 +407,24 @@ mod tests {
             let want = 0.5 * (orig.data[k] + full.data[k]);
             assert!((half.data[k] - want).abs() < 1e-6, "{k}");
         }
-        // The first final was tidied away; one final and the denoise cache remain.
-        let finals = std::fs::read_dir(t.image_dir(&dir).join("enhanced")).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains("_final-")).count();
-        assert_eq!(finals, 1);
+        // Both finals are kept, so going back to the first is free.
+        let finals = || std::fs::read_dir(t.image_dir(&dir).join("enhanced")).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains("_final-")).map(|e| e.path()).collect::<Vec<_>>();
+        assert_eq!(finals().len(), 2);
+        let mtime = |p: &Path| std::fs::metadata(p).unwrap().modified().unwrap();
+        let before = mtime(&e.masters[0].path);
+        let again = apply(&t, &dir, &s, &|_| {}, &AtomicBool::new(false)).unwrap();
+        assert_eq!(again.masters[0].path, e.masters[0].path);
+        // Reuse leaves the modified time (later caches' signatures) alone.
+        assert_eq!(mtime(&again.masters[0].path), before);
+        // Past KEEP_RESULTS, the least recently used goes (here s2's).
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for a in [0.2f32, 0.3] {
+            apply(&t, &dir, &EnhanceSettings { denoise_amount: a, ..s.clone() }, &|_| {}, &AtomicBool::new(false)).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let left = finals();
+        assert_eq!(left.len(), KEEP_RESULTS);
+        assert!(left.contains(&e.masters[0].path) && !left.contains(&e2.masters[0].path));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

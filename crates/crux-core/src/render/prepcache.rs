@@ -323,14 +323,46 @@ fn take_vec(img: &mut impl FnMut(&ImgHead) -> Option<Image>, n: usize) -> Option
 /// `prepare` for the GUI, from the cache when the masters and settings are
 /// unchanged; a fresh preparation is saved for next time.
 pub fn prepare(t: &Target, out: &Path, g: &GradientSettings, st: &StarSettings, cancel: &std::sync::atomic::AtomicBool) -> Result<Prepared> {
-    let file = path(t, out);
+    let slots = slots(&path(t, out));
     let sig = signature(t, g, st);
-    if let Some(p) = load(&file, &sig) {
-        return Ok(p);
+    for (i, f) in slots.iter().enumerate() {
+        if let Some(p) = load(f, &sig) {
+            promote(&slots, i);
+            return Ok(p);
+        }
     }
     let p = super::prepare(t, g, st, false, cancel)?;
-    let _ = save(&file, &sig, &p);
+    // Make room at the front: the oldest goes, the rest move down one.
+    let _ = std::fs::remove_file(&slots[SLOTS - 1]);
+    for k in (1..SLOTS).rev() {
+        let _ = std::fs::rename(&slots[k - 1], &slots[k]);
+    }
+    let _ = save(&slots[0], &sig, &p);
     Ok(p)
+}
+
+/// How many preparations a target keeps (switching between a few enhance
+/// or star settings finds each one).
+const SLOTS: usize = 3;
+
+/// `prepared.cache` (the most recent), then `prepared.1.cache`, … .
+pub fn slots(front: &Path) -> Vec<PathBuf> {
+    (0..SLOTS).map(|k| if k == 0 { front.to_path_buf() } else { front.with_extension(format!("{k}.cache")) }).collect()
+}
+
+/// Move slot `i` to the front, the ones before it down one.
+fn promote(slots: &[PathBuf], i: usize) {
+    if i == 0 {
+        return;
+    }
+    let tmp = slots[0].with_extension("cache.swap");
+    if std::fs::rename(&slots[i], &tmp).is_err() {
+        return;
+    }
+    for k in (1..=i).rev() {
+        let _ = std::fs::rename(&slots[k - 1], &slots[k]);
+    }
+    let _ = std::fs::rename(&tmp, &slots[0]);
 }
 
 #[cfg(test)]
@@ -390,6 +422,22 @@ mod tests {
         let img = crate::read_image(&t.masters[0].path).unwrap();
         crate::xisf::write_image(&t.masters[0].path, &img, &Header::default(), None).unwrap();
         assert!(load(&file, &signature(&t, &g, &st)).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn promote_moves_a_slot_to_the_front() {
+        let dir = std::env::temp_dir().join(format!("crux-prepslots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = slots(&dir.join("prepared.cache"));
+        assert!(s[1].ends_with("prepared.1.cache") && s[2].ends_with("prepared.2.cache"));
+        for (k, f) in s.iter().enumerate() {
+            std::fs::write(f, [k as u8]).unwrap();
+        }
+        promote(&s, 2);
+        let read = |k: usize| std::fs::read(&s[k]).unwrap()[0];
+        assert_eq!((read(0), read(1), read(2)), (2, 0, 1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

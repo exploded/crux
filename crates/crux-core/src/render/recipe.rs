@@ -30,8 +30,10 @@ pub struct Recipe {
     pub enhance: super::enhance::EnhanceSettings,
     /// Natural star colours (narrowband with OIII; ignored otherwise).
     pub stars: StarSettings,
-    /// The part of the picture to keep. Belongs to one target: kept in
-    /// its `recipe.toml`, left out of saved recipes.
+    /// The part of the picture to keep. None trims the empty edges
+    /// (`render::auto_crop`, the default); `Crop::WHOLE` keeps everything.
+    /// Belongs to one target: kept in its `recipe.toml`, left out of saved
+    /// recipes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub crop: Option<Crop>,
     /// Quarter turns clockwise (0–3), applied with the crop; the crop is

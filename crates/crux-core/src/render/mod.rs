@@ -1202,13 +1202,19 @@ pub fn render_full(p: &Prepared, r: &Recipe) -> Result<Rgb> {
     // The crop is in the turned picture: cut first (turned back), then turn
     // the smaller result.
     let q = r.rotate % 4;
-    let rgb = match &r.crop {
+    let rgb = match crop_of(p, r) {
         Some(c) if !c.is_whole() => rgb.cropped(&c.turned(4 - q)),
         _ => rgb,
     };
     let rgb = rgb.rotated(q);
     laps.lap("crop and turn");
     Ok(rgb)
+}
+
+/// The crop the recipe asks for, in the turned picture: its own, or with
+/// none set, the empty edges trimmed (the default).
+pub fn crop_of(p: &Prepared, r: &Recipe) -> Option<recipe::Crop> {
+    r.crop.or_else(|| auto_crop(p).map(|c| c.turned(r.rotate % 4)))
 }
 
 /// The largest rectangle with data in every channel: trims the empty
