@@ -49,10 +49,33 @@ impl Cli {
     }
 }
 
-/// Where the CLI is: `CRUX_RC_ASTRO`, the install folder, or the PATH.
+static PATH: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+/// The CLI chosen in Settings (`[tools] rc_astro`; `None`: search the
+/// install folder and the PATH). `Config::load` and the Settings page call it.
+pub fn set_path(exe: Option<PathBuf>) {
+    *PATH.write().unwrap_or_else(|e| e.into_inner()) = exe;
+}
+
+/// Where the CLI is: `CRUX_RC_ASTRO`, the one chosen in Settings, the
+/// install folder, or the PATH.
 pub fn find() -> Option<PathBuf> {
+    find_where().map(|(p, _)| p)
+}
+
+/// `find`, plus where the path came from.
+pub fn find_where() -> Option<(PathBuf, crate::catalog::Source)> {
+    find_with(PATH.read().unwrap_or_else(|e| e.into_inner()).clone())
+}
+
+/// `find_where` with `chosen` standing in for the Settings path.
+pub fn find_with(chosen: Option<PathBuf>) -> Option<(PathBuf, crate::catalog::Source)> {
+    use crate::catalog::Source;
     if let Some(p) = std::env::var_os("CRUX_RC_ASTRO").map(PathBuf::from).filter(|p| p.is_file()) {
-        return Some(p);
+        return Some((p, Source::Env));
+    }
+    if let Some(p) = chosen.filter(|p| p.is_file()) {
+        return Some((p, Source::Setting));
     }
     let exe = if cfg!(windows) { "rc-astro.exe" } else { "rc-astro" };
     let mut dirs: Vec<PathBuf> = Vec::new();
@@ -70,7 +93,7 @@ pub fn find() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("PATH") {
         dirs.extend(std::env::split_paths(&path));
     }
-    dirs.into_iter().map(|d| d.join(exe)).find(|p| p.is_file())
+    dirs.into_iter().map(|d| d.join(exe)).find(|p| p.is_file()).map(|p| (p, Source::Install))
 }
 
 fn command(exe: &Path) -> Command {

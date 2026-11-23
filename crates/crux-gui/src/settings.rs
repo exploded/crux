@@ -32,6 +32,11 @@ pub struct SettingsUi {
     search_text: String,
     workspace_text: String,
     root_text: String,
+    catalog_text: String,
+    rc_text: String,
+    /// What the Add-ons card found for the draft's choices, worked out
+    /// again only when they change.
+    found: Option<(crux_core::config::Tools, String, String)>,
     /// A saved site or camera change waits for the folder to reopen.
     reopen: bool,
 }
@@ -53,6 +58,8 @@ impl SettingsUi {
         self.search_text = c.library.search.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n");
         self.workspace_text = c.process.workspace.display().to_string();
         self.root_text = c.library.root.display().to_string();
+        self.catalog_text = c.tools.catalog.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+        self.rc_text = c.tools.rc_astro.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
     }
 }
 
@@ -99,6 +106,8 @@ pub fn show(ui: &mut Ui, a: &mut UiState, s: Option<&mut Session>) {
         ui.add_space(10.0);
         site(ui, &p, &mut d, &def);
         ui.add_space(10.0);
+        addons(ui, &p, st, &mut d);
+        ui.add_space(10.0);
         go_fresh = crate::fresh::card(ui, &p, fresh, busy, ixp.as_deref(), explicit.as_deref(), &fresh_cfg);
         ui.add_space(10.0);
     });
@@ -113,6 +122,8 @@ pub fn show(ui: &mut Ui, a: &mut UiState, s: Option<&mut Session>) {
             match d.save_user() {
                 Ok(path) => {
                     crux_core::gpu::set_enabled(d.gpu.r#use == crux_core::config::GpuUse::Auto);
+                    d.tools.apply();
+                    a.stack.img.recheck_tools();
                     let old = std::mem::replace(&mut st.saved, d.clone());
                     st.file = Some(path);
                     st.error = None;
@@ -179,6 +190,7 @@ fn apply(stack: &mut crate::stack::StackUi, s: &mut Session, old: &Config, new: 
     }
     b.site = new.site.clone();
     b.camera = new.camera.clone();
+    b.tools = new.tools.clone();
     let reopen = !same(&before.site, &b.site) || !same(&before.camera, &b.camera);
     s.regrade();
     // The Stack page's settings follow the new defaults unless changed there.
@@ -381,6 +393,83 @@ fn library(ui: &mut Ui, p: &Pal, st: &mut SettingsUi, d: &mut Config, def: &Conf
             });
             ui.end_row();
             check(ui, p, "Cache inside each data folder", "Keep each folder's cache in <folder>\\.crux, as crux did before, instead of in your user data folder. Off keeps the data folders untouched.", &mut d.cache.in_folder, def.cache.in_folder);
+        });
+    });
+}
+
+/// A path to another program's files; empty means "find it". The line
+/// under it says what crux found.
+#[allow(clippy::too_many_arguments)]
+fn tool_path(ui: &mut Ui, p: &Pal, text_label: &str, help: &str, v: &mut Option<PathBuf>, text: &mut String, folder: bool, found: &str) {
+    label(ui, text_label, help);
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            if ui.add(egui::TextEdit::singleline(text).desired_width(320.0).font(mono(12.0)).hint_text("found automatically")).changed() {
+                let t = text.trim();
+                *v = (!t.is_empty()).then(|| PathBuf::from(t));
+            }
+            if ui.button("Browse…").clicked() {
+                let mut dlg = rfd::FileDialog::new().set_title(text_label);
+                if let Some(dir) = v.as_deref().map(|x| if folder { x } else { x.parent().unwrap_or(x) }) {
+                    dlg = dlg.set_directory(dir);
+                }
+                let picked = if folder {
+                    dlg.pick_folder()
+                } else {
+                    if cfg!(windows) {
+                        dlg = dlg.add_filter("rc-astro", &["exe"]);
+                    }
+                    dlg.pick_file()
+                };
+                if let Some(f) = picked {
+                    *text = f.display().to_string();
+                    *v = Some(f);
+                }
+            }
+        });
+        ui.label(RichText::new(found).font(body(11.5)).color(p.muted));
+    });
+    ui.horizontal(|ui| {
+        if source(ui, p, v.is_some()) {
+            *v = None;
+            text.clear();
+        }
+    });
+    ui.end_row();
+}
+
+/// What crux finds with these choices, in words.
+fn found_text(t: &crux_core::config::Tools) -> (String, String) {
+    use crux_core::catalog::{Catalog, Source};
+    let from = |s: Source, env: &str, chosen: bool| match s {
+        Source::Env => format!(" (set by {env}, which wins over this setting)"),
+        Source::Install if chosen => " (nothing usable at the path above, so the usual install)".into(),
+        _ => String::new(),
+    };
+    let cat = match Catalog::find_with(t.catalog.clone()) {
+        Some((c, s)) => format!("Using {} in {}{}", c.name.to_uppercase(), c.dir.display(), from(s, "CRUX_CATALOG", t.catalog.is_some())),
+        None => "No star database found: install ASTAP with its D50 database, or choose the folder holding d50_*.1476. Plate solving and mosaics need it.".into(),
+    };
+    let rc = match crux_core::rcastro::find_with(t.rc_astro.clone()) {
+        Some((x, s)) => format!("Using {}{}", x.display(), from(s, "CRUX_RC_ASTRO", t.rc_astro.is_some())),
+        None => "Not found. Only needed for the RC Astro engine in Sharpen and denoise.".into(),
+    };
+    (cat, rc)
+}
+
+fn addons(ui: &mut Ui, p: &Pal, st: &mut SettingsUi, d: &mut Config) {
+    if st.found.as_ref().is_none_or(|(t, _, _)| *t != d.tools) {
+        let (c, r) = found_text(&d.tools);
+        st.found = Some((d.tools.clone(), c, r));
+    }
+    let (cat, rc) = st.found.as_ref().map(|(_, c, r)| (c.clone(), r.clone())).unwrap_or_default();
+    w::card(ui, p, |ui| {
+        w::h2(ui, "Add-ons");
+        w::muted(ui, p, "Other programs crux uses when they're installed. Leave a box empty to let crux find them in their usual folders.");
+        ui.add_space(6.0);
+        grid(ui, "set-tools", |ui| {
+            tool_path(ui, p, "Star database", "ASTAP's star database (D50 or another .1476 database), read in place to plate-solve masters and place mosaic panels. Choose the folder holding d50_*.1476.", &mut d.tools.catalog, &mut st.catalog_text, true, &cat);
+            tool_path(ui, p, "RC Astro CLI", "RC Astro's stand-alone command-line program (rc-astro), for the RC Astro engine in Sharpen and denoise. Uses your own RC Astro licence.", &mut d.tools.rc_astro, &mut st.rc_text, false, &rc);
         });
     });
 }

@@ -117,6 +117,11 @@ pub struct ImageUi {
 }
 
 impl ImageUi {
+    /// Check again which engines can run (Settings changed RC Astro's path).
+    pub fn recheck_tools(&mut self) {
+        self.enh_avail = None;
+    }
+
     /// Harness: the preview's share of the column (`img-view:<f>`).
     pub fn set_view_frac(&mut self, f: f32) {
         self.view_frac = f.clamp(0.15, 0.85);

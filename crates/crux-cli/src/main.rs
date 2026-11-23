@@ -248,7 +248,7 @@ enum Cmd {
         yes: bool,
     },
     /// Plate-solve <dir>'s lights from their measured stars (ASTAP's D50
-    /// star database, found in its install folder or CRUX_CATALOG).
+    /// star database, found in its install folder, [tools] catalog or CRUX_CATALOG).
     /// Solutions are kept in the library index in the cache folder.
     Solve {
         dir: PathBuf,
@@ -1238,7 +1238,7 @@ fn darks(cli: &Cli, dir: &Path, also: &[PathBuf]) -> Result<()> {
 fn rc_astro(image: Option<&Path>, out: Option<&Path>, bxt: Option<&str>, ss: Option<f32>, ash: Option<f32>, sn: Option<f32>, psf: Option<f32>, nxt: bool, dn: Option<f32>, sxt: bool, stars: bool, device: Option<&str>) -> Result<()> {
     use crux_core::rcastro::{self, Step};
     use std::io::Write;
-    let exe = rcastro::find().ok_or_else(|| anyhow::anyhow!("RC Astro's CLI (rc-astro) isn't installed: get it from your RC Astro account, or set CRUX_RC_ASTRO to rc-astro.exe"))?;
+    let exe = rcastro::find().ok_or_else(|| anyhow::anyhow!("RC Astro's CLI (rc-astro) isn't installed: get it from your RC Astro account, or set [tools] rc_astro in crux.toml (or CRUX_RC_ASTRO) to rc-astro.exe"))?;
     let cli = rcastro::probe(&exe)?;
     let Some(image) = image else {
         println!("rc-astro {} at {}", cli.version, cli.exe.display());
@@ -1477,7 +1477,7 @@ Calibration");
 Mosaic");
             mosaic(&plan.out, None, &cfg.mosaic, false, cfg.process.fits)?;
         } else {
-            println!("note: panels found but no star database to place them (install ASTAP with D50, or set CRUX_CATALOG); skipped the mosaic");
+            println!("note: panels found but no star database to place them (install ASTAP with D50, or set [tools] catalog in crux.toml); skipped the mosaic");
         }
     }
     println!("Output: {}", plan.out.display());
@@ -1525,7 +1525,7 @@ fn dms(deg: f64) -> String {
 }
 
 fn solve(cli: &Cli, dir: &Path, only: Option<&str>, force: bool) -> Result<()> {
-    let cat = crux_core::catalog::Catalog::find().ok_or_else(|| anyhow::anyhow!("no star database found: install ASTAP with its D50 database, or set CRUX_CATALOG to the folder holding d50_*.1476"))?;
+    let cat = crux_core::catalog::Catalog::find().ok_or_else(|| anyhow::anyhow!("no star database found: install ASTAP with its D50 database, or set [tools] catalog in crux.toml (or CRUX_CATALOG) to the folder holding d50_*.1476"))?;
     let (_, t) = triage(cli, dir, true)?;
     let mut index = if cli.no_cache { None } else { Some(crux_core::index::Index::load(&crux_core::cachedir::index_for(&cache_dir(cli, dir)))?) };
     let mut from_index = 0;
@@ -1796,7 +1796,7 @@ fn mosaic(out: &Path, target: Option<&str>, s: &crux_core::process::mosaic::Sett
         println!("no mosaic targets in {} (needs integrated masters of two or more panels of one target)", out.display());
         return Ok(());
     }
-    let cat = crux_core::catalog::Catalog::find().ok_or_else(|| anyhow::anyhow!("no star database found: install ASTAP with its D50 database, or set CRUX_CATALOG to the folder holding d50_*.1476"))?;
+    let cat = crux_core::catalog::Catalog::find().ok_or_else(|| anyhow::anyhow!("no star database found: install ASTAP with its D50 database, or set [tools] catalog in crux.toml (or CRUX_CATALOG) to the folder holding d50_*.1476"))?;
     let cancel = std::sync::atomic::AtomicBool::new(false);
     for g in &groups {
         println!("{}: {} panels, {}", g.target, g.panels(), g.filters().join(" "));

@@ -154,7 +154,7 @@ fn start(m: &mut MosaicUi, out: &std::path::Path, tx: &Sender<Msg>, ctx: &egui::
         .name("crux-mosaic".into())
         .spawn(move || {
             let res = (|| {
-                let cat = crux_core::catalog::Catalog::find().ok_or_else(|| "no star database to place the panels: install ASTAP with its D50 database, or set CRUX_CATALOG".to_string())?;
+                let cat = crux_core::catalog::Catalog::find().ok_or_else(|| "no star database to place the panels: install ASTAP with its D50 database, or choose its folder in Settings (Add-ons)".to_string())?;
                 let txp = tx.clone();
                 let ctxp = ctx.clone();
                 mosaic::assemble(

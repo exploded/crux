@@ -24,6 +24,8 @@ pub struct Config {
     pub mosaic: crate::process::mosaic::Settings,
     /// The graphics card.
     pub gpu: GpuSettings,
+    /// Other programs crux can use: ASTAP's star database, RC Astro's CLI.
+    pub tools: Tools,
 }
 
 impl Default for Config {
@@ -41,7 +43,30 @@ impl Default for Config {
             cache: CacheSettings::default(),
             mosaic: Default::default(),
             gpu: GpuSettings::default(),
+            tools: Tools::default(),
         }
+    }
+}
+
+/// Where other programs' files are, when crux can't find them itself.
+/// `None` searches the usual install folders. The environment variables
+/// `CRUX_CATALOG` and `CRUX_RC_ASTRO` win over these.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct Tools {
+    /// The folder holding ASTAP's star database (`d50_*.1476`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<PathBuf>,
+    /// RC Astro's CLI (`rc-astro.exe`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rc_astro: Option<PathBuf>,
+}
+
+impl Tools {
+    /// Make these the process-wide choices (`Catalog::find`, `rcastro::find`).
+    pub fn apply(&self) {
+        crate::catalog::set_folder(self.catalog.clone());
+        crate::rcastro::set_path(self.rc_astro.clone());
     }
 }
 
@@ -665,6 +690,7 @@ impl Config {
                 let text = std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
                 let cfg: Config = toml::from_str(&text).with_context(|| format!("parse {}", p.display()))?;
                 crate::gpu::set_enabled(cfg.gpu.r#use == GpuUse::Auto);
+                cfg.tools.apply();
                 return Ok((cfg, Some(p)));
             }
             if explicit.is_some() {
@@ -672,6 +698,7 @@ impl Config {
             }
         }
         crate::gpu::set_enabled(true);
+        Tools::default().apply();
         Ok((Config::default(), None))
     }
 
@@ -790,5 +817,35 @@ mod tests {
         assert_eq!(back.site.timezone, "Europe/London");
         assert_eq!(back.site.latitude, c.site.latitude);
         assert_eq!(back.library.search, c.library.search);
+    }
+
+    #[test]
+    fn tools_saved_only_when_chosen() {
+        let mut c = Config::default();
+        assert!(!c.changes_toml().contains("tools"));
+        c.tools.catalog = Some(PathBuf::from("/data/astap"));
+        let t = c.changes_toml();
+        assert!(t.contains("[tools]") && t.contains("catalog") && !t.contains("rc_astro"), "{t}");
+        let back: Config = toml::from_str(&t).unwrap();
+        assert_eq!(back.tools, c.tools);
+    }
+
+    #[test]
+    fn catalog_falls_back_past_a_wrong_folder() {
+        // A chosen folder without a database must not hide the usual
+        // install (or, without one, give a database that isn't there).
+        let empty = std::env::temp_dir().join(format!("crux-cat-test-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        let usual = crate::catalog::Catalog::find_with(None).map(|(c, _)| c.dir);
+        let chosen = crate::catalog::Catalog::find_with(Some(empty.clone())).map(|(c, _)| c.dir);
+        assert_eq!(chosen, usual);
+        let missing = crate::catalog::Catalog::find_with(Some(empty.join("not-there"))).map(|(c, _)| c.dir);
+        assert_eq!(missing, usual);
+        let _ = std::fs::remove_dir(&empty);
+        if let (Some(dir), None) = (usual, std::env::var_os("CRUX_CATALOG")) {
+            let (_, src) = crate::catalog::Catalog::find_with(Some(dir)).unwrap();
+            assert_eq!(src, crate::catalog::Source::Setting);
+        }
+        assert!(crate::rcastro::find_with(Some(PathBuf::from("/no/such/rc-astro"))).map(|(p, _)| p) == crate::rcastro::find_with(None).map(|(p, _)| p));
     }
 }

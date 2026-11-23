@@ -28,6 +28,38 @@ pub struct CatStar {
     pub mag: f32,
 }
 
+/// Where a found program or database came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// The environment variable (`CRUX_CATALOG`, `CRUX_RC_ASTRO`).
+    Env,
+    /// Settings (`[tools]` in `crux.toml`).
+    Setting,
+    /// The program's usual install folder (or the PATH).
+    Install,
+}
+
+static FOLDER: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+/// The star database folder chosen in Settings (`None`: search the usual
+/// install folders). `Config::load` and the Settings page call it.
+pub fn set_folder(dir: Option<PathBuf>) {
+    *FOLDER.write().unwrap_or_else(|e| e.into_inner()) = dir;
+}
+
+fn chosen_folder() -> Option<PathBuf> {
+    FOLDER.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// ASTAP's usual install folders on this system.
+pub fn install_folders() -> Vec<PathBuf> {
+    if cfg!(windows) {
+        vec![PathBuf::from(r"C:\Program Files\astap"), PathBuf::from(r"C:\Program Files (x86)\astap")]
+    } else {
+        vec![PathBuf::from("/opt/astap"), PathBuf::from("/usr/share/astap/data"), PathBuf::from("/Applications/ASTAP.app/Contents/MacOS")]
+    }
+}
+
 pub struct Catalog {
     pub dir: PathBuf,
     /// "d50", "d80", "d05", "h18"…
@@ -88,25 +120,35 @@ impl Catalog {
         Ok(Catalog { dir: dir.to_path_buf(), name: name.to_string(), tiles: Mutex::new(HashMap::new()) })
     }
 
-    /// Find an installed database: `CRUX_CATALOG` (a folder), then ASTAP's
-    /// usual install folders. Prefers the deepest (D80, D50, D20, D05, V50, H18).
+    /// Find an installed database: `CRUX_CATALOG` (a folder), then the
+    /// folder chosen in Settings (`[tools] catalog`, see `set_folder`), then
+    /// ASTAP's usual install folders. Prefers the deepest (D80, D50, D20,
+    /// D05, V50, H18).
     pub fn find() -> Option<Catalog> {
-        let mut dirs: Vec<PathBuf> = Vec::new();
+        Catalog::find_where().map(|(c, _)| c)
+    }
+
+    /// `find`, plus where the folder came from.
+    pub fn find_where() -> Option<(Catalog, Source)> {
+        Catalog::find_with(chosen_folder())
+    }
+
+    /// `find_where` with `chosen` standing in for the Settings folder.
+    pub fn find_with(chosen: Option<PathBuf>) -> Option<(Catalog, Source)> {
+        let mut dirs: Vec<(PathBuf, Source)> = Vec::new();
         if let Some(d) = std::env::var_os("CRUX_CATALOG") {
-            dirs.push(PathBuf::from(d));
+            dirs.push((PathBuf::from(d), Source::Env));
         }
-        if cfg!(windows) {
-            dirs.push(PathBuf::from(r"C:\Program Files\astap"));
-            dirs.push(PathBuf::from(r"C:\Program Files (x86)\astap"));
-        } else {
-            dirs.push(PathBuf::from("/opt/astap"));
-            dirs.push(PathBuf::from("/usr/share/astap/data"));
-            dirs.push(PathBuf::from("/Applications/ASTAP.app/Contents/MacOS"));
+        if let Some(d) = chosen {
+            dirs.push((d, Source::Setting));
         }
-        for d in dirs {
+        for d in install_folders() {
+            dirs.push((d, Source::Install));
+        }
+        for (d, src) in dirs {
             for name in ["d80", "d50", "d20", "d05", "v50", "h18", "h17"] {
                 if let Ok(c) = Catalog::open(&d, name) {
-                    return Some(c);
+                    return Some((c, src));
                 }
             }
         }

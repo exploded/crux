@@ -177,11 +177,14 @@ to that run.
 ## Optional tools
 
 - **Plate solving** needs one of [ASTAP](https://www.hnsky.org/astap.htm)'s
-  star databases, such as D50. crux looks in `C:\Program Files\astap`, or
-  in the folder named by `CRUX_CATALOG`. It reads the catalogue directly and
+  star databases, such as D50. crux looks in ASTAP's install folder
+  (`C:\Program Files\astap` on Windows). If yours is elsewhere, choose its
+  folder in Settings, under Add-ons. crux reads the catalogue directly and
   doesn't run ASTAP itself.
 - **RC Astro tools:** if you own licences for RC Astro's command-line tools,
-  the Image stage can run them on your images. crux isn't
+  the Image stage can run them on your images. crux finds `rc-astro` in its
+  install folder or on the PATH, or you can choose it in Settings, under
+  Add-ons. crux isn't
   affiliated with RC Astro and doesn't include its software. RC Astro's
   software and its outputs aren't used to develop or evaluate crux's
   networks.

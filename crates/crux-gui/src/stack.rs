@@ -313,7 +313,7 @@ impl StackUi {
             .name("crux-solve".into())
             .spawn(move || {
                 let Some(cat) = crux_core::catalog::Catalog::find() else {
-                    let _ = tx.send(Msg::SolveFailed("No star database found: install ASTAP with its D50 database, or set CRUX_CATALOG.".into()));
+                    let _ = tx.send(Msg::SolveFailed("No star database found: install ASTAP with its D50 database, or choose its folder in Settings (Add-ons).".into()));
                     ctx.request_repaint();
                     return;
                 };

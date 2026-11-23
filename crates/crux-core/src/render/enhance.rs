@@ -109,7 +109,7 @@ pub fn availability(engine: Engine, sharpen: bool) -> std::result::Result<(), St
             }
         }
         Engine::RcAstro => {
-            let exe = crate::rcastro::find().ok_or("RC Astro's CLI (rc-astro) isn't installed")?;
+            let exe = crate::rcastro::find().ok_or("RC Astro's CLI (rc-astro) wasn't found: install it, or choose rc-astro in Settings (Add-ons)")?;
             let cli = crate::rcastro::probe(&exe).map_err(|e| format!("{e:#}"))?;
             let need: &[&str] = if sharpen { &["bxt"] } else { &["nxt"] };
             for k in need {
@@ -343,7 +343,7 @@ fn crux_engine(master: &Path, dir: &Path, ch: &str, mh: &str, s: &EnhanceSetting
 
 fn rc_engine(master: &Path, s: &EnhanceSettings, fin: &Path, p: &(dyn Fn(&str, f32) + Sync), cancel: &AtomicBool) -> Result<()> {
     use crate::rcastro::{self, Bxt, Nxt, Step};
-    let exe = rcastro::find().ok_or_else(|| anyhow::anyhow!("RC Astro's CLI (rc-astro) isn't installed"))?;
+    let exe = rcastro::find().ok_or_else(|| anyhow::anyhow!("RC Astro's CLI (rc-astro) wasn't found: install it, or choose rc-astro in Settings (Add-ons)"))?;
     let cli = rcastro::probe(&exe)?;
     let a = s.sharpen_amount.clamp(0.0, 1.0);
     let mut steps = Vec::new();
