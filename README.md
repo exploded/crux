@@ -66,6 +66,12 @@ crux is written in Rust. It's developed with the GNU toolchain on Windows
 
 The binaries are in `target\release`.
 
+GitHub Actions runs the tests on every push. It builds crux and crux-gui for
+Windows, Linux and macOS (Apple Silicon) when a version tag such as `v0.1.0`
+is pushed, and attaches them to a draft release. You can also run the Build
+workflow by hand from the Actions tab and download the builds from that run.
+The Linux and macOS builds haven't been tried on a real machine yet.
+
 ### Features
 
 All three features are on by default:

@@ -32,6 +32,13 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 debug = 1
 lto = "thin"
 
+# Downloadable builds (GitHub Actions): release without debug info, so the
+# binaries are a fraction of the size. build.bat still uses `release`.
+[profile.dist]
+inherits = "release"
+debug = 0
+strip = true
+
 # Pixel loops are hot even in debug builds; keep tests usable.
 [profile.dev.package."*"]
 opt-level = 2

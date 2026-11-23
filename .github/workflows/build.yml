@@ -1,0 +1,129 @@
+# Tests on every push and pull request. Builds crux and crux-gui for
+# Windows, Linux and macOS when a version tag (v0.1.0) is pushed, or when
+# the workflow is run by hand (Actions > Build > Run workflow). A tag also
+# makes a draft GitHub Release with the builds attached.
+#
+# Windows builds here use the MSVC toolchain (the runners have Visual
+# Studio), not the GNU toolchain and MSYS2 that build.bat uses.
+
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    # Linux and macOS have never run the tests, so their failures are
+    # reported but don't stop the builds yet.
+    continue-on-error: ${{ matrix.os != 'windows-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-22.04, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Linux libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libwayland-dev libxkbcommon-dev libx11-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test --workspace --locked
+
+  build:
+    name: Build (${{ matrix.name }})
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: test
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+          - name: linux-x86_64
+            # The oldest supported Ubuntu, so the binaries run on older glibc.
+            os: ubuntu-22.04
+          - name: macos-arm64
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Linux libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libwayland-dev libxkbcommon-dev libx11-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ startsWith(github.ref, 'refs/tags/') }}
+      # The dist profile is the release profile without debug info.
+      - run: cargo build --workspace --profile dist --locked
+      - name: Package
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="dev-${GITHUB_SHA::7}"
+          fi
+          dir="crux-$version-${{ matrix.name }}"
+          mkdir -p "dist/$dir"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            cp target/dist/crux.exe target/dist/crux-gui.exe "dist/$dir/"
+          else
+            cp target/dist/crux target/dist/crux-gui "dist/$dir/"
+          fi
+          cp LICENSE README.md "dist/$dir/"
+          cd dist
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            7z a -tzip "$dir.zip" "$dir" > /dev/null
+          else
+            tar -czf "$dir.tar.gz" "$dir"
+          fi
+          rm -r "$dir"
+          ls -l
+      - uses: actions/upload-artifact@v7
+        with:
+          name: crux-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: crux-*
+          path: dist
+          merge-multiple: true
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --title "crux $GITHUB_REF_NAME" \
+            --generate-notes
