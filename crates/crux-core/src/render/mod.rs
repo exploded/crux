@@ -764,11 +764,11 @@ fn gauss3(a: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
             c
         })
         .collect();
-    for (x, c) in cols.iter().enumerate() {
-        for y in 0..h {
-            out[y * w + x] = c[y];
+    out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        for (x, v) in row.iter_mut().enumerate() {
+            *v = cols[x][y];
         }
-    }
+    });
     out
 }
 
@@ -880,7 +880,7 @@ fn neutral_of(p: &Prepared, r: &Recipe, coef: &palette::Coef, frame: Frame) -> O
     let (mw, mh) = (first.width, first.height);
     let n = mw * mh;
     let (mut rr, mut gg, mut bb) = (vec![0f32; n], vec![0f32; n], vec![0f32; n]);
-    palette::process(&sp, coef, &mut rr, &mut gg, &mut bb);
+    palette::process_par(&sp, coef, &mut rr, &mut gg, &mut bb);
     let lum: Vec<f32> = (0..n).map(|i| (rr[i] + gg[i] + bb[i]) / 3.0).collect();
     // Pixels with data (crop edges and empty corners are zero).
     let mut ls: Vec<f32> = lum.iter().copied().filter(|l| *l > 0.005).collect();
@@ -896,12 +896,14 @@ fn neutral_of(p: &Prepared, r: &Recipe, coef: &palette::Coef, frame: Frame) -> O
         (s / c.max(1.0)) as f32
     };
     let sigma = NEUTRAL_SIGMA * mw as f32;
-    let wsum = gauss3(&dark, mw, mh, sigma);
-    let mean_of = |c: &[f32]| -> Vec<f32> {
-        let m: Vec<f32> = c.iter().zip(&dark).map(|(v, d)| v * d).collect();
-        gauss3(&m, mw, mh, sigma).iter().zip(&wsum).map(|(v, w)| if *w > 1.0e-3 { v / w } else { 0.0 }).collect()
-    };
-    let (mr, mg, mb) = (mean_of(&rr), mean_of(&gg), mean_of(&bb));
+    // The four blurs side by side (each is short of work for every core).
+    let masked = |c: &[f32]| -> Vec<f32> { c.iter().zip(&dark).map(|(v, d)| v * d).collect() };
+    let ((wsum, br), (bg, bb2)) = rayon::join(
+        || rayon::join(|| gauss3(&dark, mw, mh, sigma), || gauss3(&masked(&rr), mw, mh, sigma)),
+        || rayon::join(|| gauss3(&masked(&gg), mw, mh, sigma), || gauss3(&masked(&bb), mw, mh, sigma)),
+    );
+    let mean_of = |b: Vec<f32>| -> Vec<f32> { b.iter().zip(&wsum).map(|(v, w)| if *w > 1.0e-3 { v / w } else { 0.0 }).collect() };
+    let (mr, mg, mb) = (mean_of(br), mean_of(bg), mean_of(bb2));
     let mut cast = [vec![0f32; n], vec![0f32; n], vec![0f32; n]];
     for i in 0..n {
         let m = (mr[i] + mg[i] + mb[i]) / 3.0;
@@ -922,7 +924,7 @@ fn chroma_of(p: &Prepared, r: &Recipe, coef: &palette::Coef, frame: Frame) -> Op
     let (mw, mh) = (first.width, first.height);
     let n = mw * mh;
     let (mut rr, mut gg, mut bb) = (vec![0f32; n], vec![0f32; n], vec![0f32; n]);
-    palette::process(&sp, coef, &mut rr, &mut gg, &mut bb);
+    palette::process_par(&sp, coef, &mut rr, &mut gg, &mut bb);
     let l: Vec<f32> = (0..n).map(|i| (rr[i] + gg[i] + bb[i]) / 3.0).collect();
     let sigma = (CHROMA_SIGMA * mw as f32).max(1.5);
     let ls = gauss3(&l, mw, mh, sigma);
@@ -941,7 +943,7 @@ fn detail_of(p: &Prepared, r: &Recipe, coef: &palette::Coef, frame: Frame) -> Op
     let (mw, mh) = (first.width, first.height);
     let n = mw * mh;
     let (mut rr, mut gg, mut bb) = (vec![0f32; n], vec![0f32; n], vec![0f32; n]);
-    palette::process(&sp, coef, &mut rr, &mut gg, &mut bb);
+    palette::process_par(&sp, coef, &mut rr, &mut gg, &mut bb);
     let l: Vec<f32> = (0..n).map(|i| (rr[i] + gg[i] + bb[i]) / 3.0).collect();
     let fine = gauss3(&l, mw, mh, (DETAIL_FINE * mw as f32).max(0.7));
     let coarse = gauss3(&l, mw, mh, DETAIL_COARSE * mw as f32);
@@ -989,8 +991,9 @@ fn split_of(p: &Prepared, r: &Recipe, planes: &[&[f32]], bare: &[&[f32]], frame:
     // beyond, which thins out faint stars and halos.
     let cut = r.stars.faint_cut.clamp(0.0, 50.0) as f32;
     let at_proxy = planes.first().is_some_and(|pl| pl.len() == p.channels[0].proxy.data.len());
+    use rayon::prelude::*;
     let floor = planes
-        .iter()
+        .par_iter()
         .zip(bare)
         .zip(&p.channels)
         .map(|((f, b), c)| {

@@ -1244,7 +1244,6 @@ fn settings_card(ui: &mut Ui, a: &mut UiState, s: &mut Session, p: &Pal, tx: &Se
     let Some(st) = a.stack.settings.clone() else { return };
     let mut st2 = st.clone();
     let base = Settings::from_config(&s.cfg);
-    let src = |changed: bool| if changed { RichText::new("changed here").font(body(11.0)).color(p.accent) } else { RichText::new("default").font(body(11.0)).color(p.faint) };
     match a.stack.stage {
         Stage::Calibrate => {
             w::h2(ui, "Calibrate");
@@ -1260,14 +1259,14 @@ fn settings_card(ui: &mut Ui, a: &mut UiState, s: &mut Session, p: &Pal, tx: &Se
                 let mut ped = st2.cal.pedestal_limit.is_some();
                 ui.checkbox(&mut ped, "Output pedestal when needed");
                 st2.cal.pedestal_limit = ped.then_some(0.0001);
-                ui.label(src(st2.cal.pedestal_limit != base.cal.pedestal_limit));
+                w::reset(ui, p, &mut st2.cal.pedestal_limit, &base.cal.pedestal_limit, "default");
             });
             ui.horizontal(|ui| {
                 ui.checkbox(&mut st2.include_warn, "Include frames graded warn");
-                ui.label(src(st2.include_warn != base.include_warn));
+                w::reset(ui, p, &mut st2.include_warn, &base.include_warn, "default");
                 ui.add_space(16.0);
                 ui.checkbox(&mut st2.keep_calibrated, "Also keep calibrated frames");
-                ui.label(src(st2.keep_calibrated != base.keep_calibrated));
+                w::reset(ui, p, &mut st2.keep_calibrated, &base.keep_calibrated, "default");
             });
         }
         Stage::Cosmetic => {
@@ -1279,7 +1278,7 @@ fn settings_card(ui: &mut Ui, a: &mut UiState, s: &mut Session, p: &Pal, tx: &Se
                 let mut k = st2.cal.hot_sigma.unwrap_or(10.0);
                 ui.add_enabled(on, egui::Slider::new(&mut k, 5.0..=20.0).step_by(0.5).text("σ"));
                 st2.cal.hot_sigma = on.then_some(k);
-                ui.label(src(st2.cal.hot_sigma != base.cal.hot_sigma));
+                w::reset(ui, p, &mut st2.cal.hot_sigma, &base.cal.hot_sigma, "default");
             });
         }
         Stage::Register | Stage::Solve if a.stack.stage == Stage::Register => {
@@ -1308,7 +1307,7 @@ fn settings_card(ui: &mut Ui, a: &mut UiState, s: &mut Session, p: &Pal, tx: &Se
                                 }
                             }
                         });
-                        ui.label(src(st2.reference.is_some()));
+                        w::reset(ui, p, &mut st2.reference, &None, "default");
                         if st2.reference.is_some() && ui.small_button("Back to crux's choice").clicked() {
                             st2.reference = None;
                         }
@@ -1321,7 +1320,7 @@ fn settings_card(ui: &mut Ui, a: &mut UiState, s: &mut Session, p: &Pal, tx: &Se
                 let mut c = st2.clamp.unwrap_or(0.3);
                 ui.add_enabled(on, egui::Slider::new(&mut c, 0.05..=1.0).text("threshold"));
                 st2.clamp = on.then_some(c);
-                ui.label(src(st2.clamp != base.clamp));
+                w::reset(ui, p, &mut st2.clamp, &base.clamp, "default");
             });
         }
         Stage::Integrate => integrate_card(ui, a, p, &mut st2, &base),
@@ -1365,7 +1364,6 @@ fn capital(s: &str) -> String {
 }
 
 fn integrate_card(ui: &mut Ui, a: &mut UiState, p: &Pal, st2: &mut Settings, base: &Settings) {
-    let src = |changed: bool| if changed { RichText::new("changed here").font(body(11.0)).color(p.accent) } else { RichText::new("default").font(body(11.0)).color(p.faint) };
     w::h2(ui, "Integrate");
     w::muted(
         ui,
@@ -1374,21 +1372,21 @@ fn integrate_card(ui: &mut Ui, a: &mut UiState, p: &Pal, st2: &mut Settings, bas
     );
     ui.horizontal(|ui| {
         ui.checkbox(&mut st2.integrate, "Integrate master lights");
-        ui.label(src(st2.integrate != base.integrate));
+        w::reset(ui, p, &mut st2.integrate, &base.integrate, "default");
     });
     let c = &mut st2.combine;
     ui.horizontal(|ui| {
         ui.label(RichText::new("Normalisation").font(body(13.0)));
         chip(ui, p, &mut c.normalisation, combine::Normalisation::Local, "Local");
         chip(ui, p, &mut c.normalisation, combine::Normalisation::Global, "Global");
-        ui.label(src(c.normalisation != base.combine.normalisation));
+        w::reset(ui, p, &mut c.normalisation, &base.combine.normalisation, "default");
     });
     ui.horizontal(|ui| {
         ui.label(RichText::new("Weights").font(body(13.0)));
         chip(ui, p, &mut c.weighting, combine::Weighting::Snr, "SNR");
         chip(ui, p, &mut c.weighting, combine::Weighting::Exposure, "Exposure");
         chip(ui, p, &mut c.weighting, combine::Weighting::Equal, "Equal");
-        ui.label(src(c.weighting != base.combine.weighting));
+        w::reset(ui, p, &mut c.weighting, &base.combine.weighting, "default");
     });
     use crux_core::process::integrate::Rejection;
     let choices: [(Option<Rejection>, &str); 7] = [
@@ -1410,7 +1408,7 @@ fn integrate_card(ui: &mut Ui, a: &mut UiState, p: &Pal, st2: &mut Settings, bas
                 }
             }
         });
-        ui.label(src(c.rejection != base.combine.rejection));
+        w::reset(ui, p, &mut c.rejection, &base.combine.rejection, "default");
     });
     let Some(plan) = a.stack.plan.clone() else { return };
     if plan.stacks.is_empty() {

@@ -397,7 +397,8 @@ impl App {
                         let tex = ctx.load_texture(format!("thumb{li}"), img, egui::TextureOptions::LINEAR);
                         self.ui.thumbs.insert(li, tex);
                     }
-                    self.ui.fu.night = s.nights.last().copied();
+                    // Frames opens on every night (James, 2026-11-23).
+                    self.ui.fu.night = None;
                     self.ui.loading = None;
                     self.session = Some(s);
                 }

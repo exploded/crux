@@ -370,6 +370,21 @@ fn quick<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     .install(f)
 }
 
+/// The preset tiles' own pool, half the cores: nine renders on `quick`'s
+/// pool held up the preview when a drag resumed while they ran.
+fn tiles_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads((n / 2).max(1))
+            .thread_name(|i| format!("crux-tiles-{i}"))
+            .build()
+            .expect("tiles thread pool")
+    })
+    .install(f)
+}
+
 fn tex(ctx: &egui::Context, name: &str, rgb: &render::Rgb) -> egui::TextureHandle {
     let img = egui::ColorImage::from_rgba_unmultiplied([rgb.width, rgb.height], &rgb.rgba8());
     ctx.load_texture(name, img, egui::TextureOptions::LINEAR)
@@ -575,7 +590,7 @@ pub fn tick(a: &mut UiState, s: &Session, tx: &Sender<Msg>, ctx: &egui::Context)
                 img.tiles_busy = true;
                 let (p, r, tx, ctx) = (p.clone(), r.clone(), tx.clone(), ctx.clone());
                 let spawned = std::thread::Builder::new().name("crux-tiles".into()).spawn(move || {
-                    let rendered: Vec<(String, render::Rgb)> = quick(|| {
+                    let rendered: Vec<(String, render::Rgb)> = tiles_pool(|| {
                         palette::presets(p.kind, &p.names())
                             .iter()
                             .map(|pr| {
@@ -1217,15 +1232,6 @@ fn tiles(ui: &mut Ui, a: &mut UiState, p: &Pal) {
     }
 }
 
-/// "default", "recipe “X”" or "changed here".
-fn src(ui: &mut Ui, p: &Pal, changed: bool, base: &str) {
-    if changed {
-        ui.label(RichText::new("changed here").font(body(11.0)).color(p.accent));
-    } else {
-        ui.label(RichText::new(base).font(body(11.0)).color(p.faint));
-    }
-}
-
 /// A labelled slider with its source tag; `pct` shows a fraction as %.
 #[allow(clippy::too_many_arguments)]
 /// Image-stage sliders: wide enough that one pixel is a small step.
@@ -1254,7 +1260,9 @@ fn slider_d(ui: &mut Ui, p: &Pal, label: &str, v: &mut f64, range: std::ops::Ran
             ui.add(egui::Slider::new(v, range).fixed_decimals(decimals + 1).smart_aim(false)).on_hover_text(help)
         };
         let _ = s;
-        src(ui, p, (*v - base).abs() > 1e-9, base_label);
+        if w::source(ui, p, (*v - base).abs() > 1e-9, base_label) {
+            *v = base;
+        }
     });
 }
 
@@ -1397,7 +1405,7 @@ fn enhance_settings(ui: &mut Ui, img: &mut ImageUi, p: &Pal, r: &mut Recipe, bas
         if resp.clicked() {
             e.engine = Engine::RcAstro;
         }
-        src(ui, p, e.engine != be.engine, base_label);
+        w::reset(ui, p, &mut e.engine, &be.engine, base_label);
     });
     let ix = if e.engine == Engine::Crux { 0 } else { 1 };
     if e.engine == Engine::RcAstro {
@@ -1417,7 +1425,7 @@ fn enhance_settings(ui: &mut Ui, img: &mut ImageUi, p: &Pal, r: &mut Recipe, bas
                 e.sharpen = m;
             }
         }
-        src(ui, p, e.sharpen != be.sharpen, base_label);
+        w::reset(ui, p, &mut e.sharpen, &be.sharpen, base_label);
     });
     if let Err(why) = &sharpen_ok {
         if e.sharpen != Sharpen::Off {
@@ -1432,7 +1440,7 @@ fn enhance_settings(ui: &mut Ui, img: &mut ImageUi, p: &Pal, r: &mut Recipe, bas
     // Noise.
     ui.horizontal(|ui| {
         ui.add_enabled_ui(avail[ix].0.is_ok(), |ui| ui.checkbox(&mut e.denoise, "Remove noise"));
-        src(ui, p, e.denoise != be.denoise, base_label);
+        w::reset(ui, p, &mut e.denoise, &be.denoise, base_label);
     });
     if let Err(why) = &avail[ix].0 {
         ui.label(RichText::new(format!("Can't remove noise: {why}.")).font(body(12.5)).color(p.warn));
@@ -1520,7 +1528,7 @@ fn settings(ui: &mut Ui, a: &mut UiState, p: &Pal) {
             if depth != Depth::Auto {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut r.gradient.enabled, "Remove gradients");
-                    src(ui, p, r.gradient.enabled != base.gradient.enabled, &base_label);
+                    w::reset(ui, p, &mut r.gradient.enabled, &base.gradient.enabled, &base_label);
                 });
                 ui.horizontal(|ui| {
                     ui.add_sized([150.0, 20.0], egui::Label::new(RichText::new("Degree").font(body(13.0))));
@@ -1532,7 +1540,7 @@ fn settings(ui: &mut Ui, a: &mut UiState, p: &Pal) {
                             r.gradient.degree = d;
                         }
                     }
-                    src(ui, p, r.gradient.degree != base.gradient.degree, &base_label);
+                    w::reset(ui, p, &mut r.gradient.degree, &base.gradient.degree, &base_label);
                 });
                 let mut tol = r.gradient.tolerance as f64;
                 slider(ui, p, "Tolerance", &mut tol, 0.3..=3.0, base.gradient.tolerance as f64, &base_label, false, "Boxes this many residual sigmas above the surface are treated as nebula. Lower protects faint nebulosity more.");
@@ -1549,7 +1557,7 @@ fn settings(ui: &mut Ui, a: &mut UiState, p: &Pal) {
                         if w::chip(ui, p, "Divide", None, r.gradient.correction == gradient::Correction::Divide).clicked() {
                             r.gradient.correction = gradient::Correction::Divide;
                         }
-                        src(ui, p, r.gradient.correction != base.gradient.correction, &base_label);
+                        w::reset(ui, p, &mut r.gradient.correction, &base.gradient.correction, &base_label);
                     });
                 }
             }
@@ -1606,7 +1614,7 @@ fn settings(ui: &mut Ui, a: &mut UiState, p: &Pal) {
                                 r.mix.balance = b;
                             }
                         }
-                        src(ui, p, r.mix.balance != base.mix.balance, &base_label);
+                        w::reset(ui, p, &mut r.mix.balance, &base.mix.balance, &base_label);
                     });
                 }
             }
@@ -1622,10 +1630,10 @@ fn settings(ui: &mut Ui, a: &mut UiState, p: &Pal) {
                 slider(ui, p, "Dark reference", &mut r.stretch.dark_ref, 0.0..=0.5, base.stretch.dark_ref, &base_label, true, "The percentile of each channel treated as neutral black. Lower it if dark dust lanes take a colour cast.");
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut r.stretch.neutral_sky, "Neutral sky background (small targets)");
-                    src(ui, p, r.stretch.neutral_sky != base.stretch.neutral_sky, &base_label);
+                    w::reset(ui, p, &mut r.stretch.neutral_sky, &base.stretch.neutral_sky, &base_label);
                     ui.add_space(12.0);
                     ui.checkbox(&mut r.stretch.linear, "Linear input");
-                    src(ui, p, r.stretch.linear != base.stretch.linear, &base_label);
+                    w::reset(ui, p, &mut r.stretch.linear, &base.stretch.linear, &base_label);
                 });
             }
         }
@@ -1669,7 +1677,7 @@ fn settings(ui: &mut Ui, a: &mut UiState, p: &Pal) {
                     if w::chip(ui, p, "As mixed", None, r.stars.mode == render::stars::StarMode::Keep).clicked() {
                         r.stars.mode = render::stars::StarMode::Keep;
                     }
-                    src(ui, p, r.stars.mode != base.stars.mode, &base_label);
+                    w::reset(ui, p, &mut r.stars.mode, &base.stars.mode, &base_label);
                 });
                 if r.stars.mode == render::stars::StarMode::Natural {
                     let ok = render::starnet::availability();
@@ -1683,7 +1691,7 @@ fn settings(ui: &mut Ui, a: &mut UiState, p: &Pal) {
                         if resp.clicked() {
                             r.stars.engine = render::stars::StarEngine::Network;
                         }
-                        src(ui, p, r.stars.engine != base.stars.engine, &base_label);
+                        w::reset(ui, p, &mut r.stars.engine, &base.stars.engine, &base_label);
                     });
                 }
                 if r.stars.mode == render::stars::StarMode::Natural {
@@ -1695,7 +1703,7 @@ fn settings(ui: &mut Ui, a: &mut UiState, p: &Pal) {
                         if w::chip(ui, p, "One stretch", None, !r.stars.separate).on_hover_text("Stars and nebula stretched together; the stars are then recoloured in place.").clicked() {
                             r.stars.separate = false;
                         }
-                        src(ui, p, r.stars.separate != base.stars.separate, &base_label);
+                        w::reset(ui, p, &mut r.stars.separate, &base.stars.separate, &base_label);
                     });
                     if r.stars.separate {
                         slider(ui, p, "Star size", &mut r.stars.size, 0.05..=1.5, base.stars.size, &base_label, true, "How hard the stars are stretched. 100% shows a star on dark sky as the nebula stretch would; lower gives smaller, fainter stars, mostly by dimming the faint ones and the halos.");

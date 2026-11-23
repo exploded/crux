@@ -536,6 +536,18 @@ pub fn coefficients(channels: &[String], stats: &[&Stats], star_gain: Option<&[f
     }
 }
 
+/// `process` over blocks of pixels in parallel (each pixel is independent,
+/// so the result is the same).
+pub fn process_par(ch: &[&[f32]], coef: &Coef, out_r: &mut [f32], out_g: &mut [f32], out_b: &mut [f32]) {
+    use rayon::prelude::*;
+    const BLOCK: usize = 1 << 15;
+    out_r.par_chunks_mut(BLOCK).zip(out_g.par_chunks_mut(BLOCK)).zip(out_b.par_chunks_mut(BLOCK)).enumerate().for_each(|(k, ((r, g), b))| {
+        let s = k * BLOCK;
+        let part: Vec<&[f32]> = ch.iter().map(|c| &c[s..s + r.len()]).collect();
+        process(&part, coef, r, g, b);
+    });
+}
+
 /// The mixer's `processPixels`: `ch[i]` is channel i's pixels; writes RGB.
 pub fn process(ch: &[&[f32]], coef: &Coef, out_r: &mut [f32], out_g: &mut [f32], out_b: &mut [f32]) {
     let n = ch.len();

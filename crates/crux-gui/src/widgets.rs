@@ -129,6 +129,31 @@ pub fn kbd(ui: &mut Ui, p: &Pal, k: &str) {
 }
 
 /// Rounded chip; filled with the foreground colour when `on`.
+/// A setting's source tag: `base` ("default", "recipe “X”") or "changed
+/// here". "changed here" is a link; true when it's clicked, meaning put the
+/// value back.
+pub fn source(ui: &mut Ui, p: &Pal, changed: bool, base: &str) -> bool {
+    if !changed {
+        ui.label(RichText::new(base).font(body(11.0)).color(p.faint));
+        return false;
+    }
+    let back = if base == "default" { "the default".to_string() } else { base.to_string() };
+    let resp = ui.add(egui::Label::new(RichText::new("changed here").font(body(11.0)).color(p.accent)).sense(Sense::click()));
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(format!("Click to go back to {back}"));
+    if resp.hovered() {
+        let r = resp.rect;
+        ui.painter().line_segment([r.left_bottom(), r.right_bottom()], Stroke::new(1.0, p.accent));
+    }
+    resp.clicked()
+}
+
+/// `source` for a value: clicking "changed here" sets it back to `base`.
+pub fn reset<T: PartialEq + Clone>(ui: &mut Ui, p: &Pal, v: &mut T, base: &T, base_label: &str) {
+    if source(ui, p, *v != *base, base_label) {
+        *v = base.clone();
+    }
+}
+
 pub fn chip(ui: &mut Ui, p: &Pal, text: &str, count: Option<usize>, on: bool) -> Response {
     let (fg, fill, stroke) = if on { (p.bg, p.fg, p.fg) } else { (p.fg, p.panel, p.line) };
     let g = ui.painter().layout_no_wrap(text.to_string(), body(12.5), fg);

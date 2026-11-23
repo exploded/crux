@@ -399,9 +399,6 @@ fn numbers(ui: &mut Ui, r: &Report, p: &Pal) {
     }
 }
 
-fn tag(ui: &mut Ui, p: &Pal, changed: bool) {
-    ui.label(RichText::new(if changed { "changed here" } else { "default" }).font(body(11.0)).color(if changed { p.accent } else { p.faint }));
-}
 
 fn settings(ui: &mut Ui, m: &mut MosaicUi, p: &Pal) {
     w::h2(ui, "Settings");
@@ -415,27 +412,29 @@ fn settings(ui: &mut Ui, m: &mut MosaicUi, p: &Pal) {
                 s.bin = b;
             }
         }
-        tag(ui, p, s.bin != base.bin);
+        w::reset(ui, p, &mut s.bin, &base.bin, "default");
     });
     ui.horizontal(|ui| {
         ui.add_sized([150.0, 20.0], egui::Label::new(RichText::new("Feather").font(body(13.0)))).on_hover_text("How far in from each panel's edge the blend reaches. Wider hides residual differences; narrower keeps more of each panel's sharpest centre.");
         ui.add(egui::Slider::new(&mut s.feather_arcmin, 1.0..=20.0).suffix("′").fixed_decimals(0));
-        tag(ui, p, (s.feather_arcmin - base.feather_arcmin).abs() > 1e-9);
+        if w::source(ui, p, (s.feather_arcmin - base.feather_arcmin).abs() > 1e-9, "default") {
+            s.feather_arcmin = base.feather_arcmin;
+        }
     });
     ui.horizontal(|ui| {
         ui.add_sized([150.0, 20.0], egui::Label::new(RichText::new("Lens distortion").font(body(13.0)))).on_hover_text("Fit each panel's distortion from catalogue stars (a cubic). Without it, stars at the panel corners can miss by tens of pixels.");
         ui.checkbox(&mut s.distortion, "");
-        tag(ui, p, s.distortion != base.distortion);
+        w::reset(ui, p, &mut s.distortion, &base.distortion, "default");
     });
     ui.horizontal(|ui| {
         ui.add_sized([150.0, 20.0], egui::Label::new(RichText::new("Match brightness").font(body(13.0)))).on_hover_text("Scale each panel by star photometry in the overlaps, then fit an offset and plane per panel so the seams don't show.");
         ui.checkbox(&mut s.match_brightness, "");
-        tag(ui, p, s.match_brightness != base.match_brightness);
+        w::reset(ui, p, &mut s.match_brightness, &base.match_brightness, "default");
     });
     ui.horizontal(|ui| {
         ui.add_sized([150.0, 20.0], egui::Label::new(RichText::new("Curved skies").font(body(13.0)))).on_hover_text("Fit a gentle curve per panel as well as a plane. This helps panels integrated against a cloudy or dawn reference frame, which keep a curved sky.");
         ui.add_enabled(s.match_brightness, egui::Checkbox::new(&mut s.curvature, ""));
-        tag(ui, p, s.curvature != base.curvature);
+        w::reset(ui, p, &mut s.curvature, &base.curvature, "default");
     });
     if built.is_some_and(|b| b != *s) {
         ui.label(RichText::new("Changed: press Assemble again to apply.").font(body(12.0)).color(p.accent));
