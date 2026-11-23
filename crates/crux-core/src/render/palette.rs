@@ -154,8 +154,15 @@ pub fn auto_stretch(med: f64, lo: f64, sigma: f64, noise: f64, o: &Stretching) -
         return s;
     }
     let x = |v: f64| ((v - bp) / (1.0 - bp)).clamp(1.0e-9, 1.0);
-    // A smaller midtones balance stretches harder.
-    let m = mtf(o.background, x(med)).min(mtf(LOW_FRACTION * o.background, x(lo)));
+    // A smaller midtones balance stretches harder. At the crossover the
+    // median's term equals the mixer's balance, but `lo`'s can be far
+    // smaller, so it comes in over one clip width of black point rise:
+    // taken at once, a mix weight moving across the line jumped the whole
+    // image's brightness (NGC 2244, OIII's blue 176% → 184%).
+    let m_med = mtf(o.background, x(med));
+    let m_lo = mtf(LOW_FRACTION * o.background, x(lo));
+    let t = ((bp - s.bp) / (o.clip * noise).max(1.0e-12)).clamp(0.0, 1.0);
+    let m = if m_lo < m_med { m_med + t * (m_lo - m_med) } else { m_med };
     Stretch { bp, m }
 }
 
@@ -794,5 +801,25 @@ mod tests {
         // Brighter in → brighter out: the background setting still works.
         let brighter = auto_stretch(a(227.0), a(122.0), a(65.0), a(6.7), &Stretching { background: 0.2, ..st.clone() });
         assert!(at(&brighter, a(227.0)) > med);
+    }
+
+    #[test]
+    fn stretch_is_continuous_where_the_black_point_starts_to_rise() {
+        // Move the darkest structure up through the crossover in small
+        // steps: the median's output level must change in small steps too.
+        let st = Stretching { background: 0.15, ..Default::default() };
+        let (med, sigma, noise) = (0.004, 0.0008, 0.0001);
+        let at = |s: &Stretch, v: f64| mtf(s.m, (v - s.bp) / (1.0 - s.bp));
+        let cross = med - st.clip * sigma + st.clip * noise;
+        let mut prev = None;
+        for k in -50..=50 {
+            let lo = cross + k as f64 * 2.0e-7;
+            let y = at(&auto_stretch(med, lo, sigma, noise, &st), med);
+            if let Some(p) = prev {
+                let step: f64 = y - p;
+                assert!(step.abs() < 0.005, "jump of {step:.4} at lo {lo}");
+            }
+            prev = Some(y);
+        }
     }
 }

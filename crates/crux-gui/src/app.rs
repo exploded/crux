@@ -437,7 +437,7 @@ impl App {
                 }
                 Msg::FpProgress { done, total } => self.ui.cal.fp_progress = Some((done, total)),
                 // Handled by the Stack page above.
-                Msg::Process(_) | Msg::ProcessDone(_) | Msg::Preview(_) | Msg::PreviewFailed(..) | Msg::Solved { .. } | Msg::SolveFailed(_) | Msg::ImagePrepared(..) | Msg::ImageWritten(_) | Msg::ImageProgress(_) | Msg::ImageEnhanceView(..) | Msg::MosaicStep(_) | Msg::MosaicDone(_) | Msg::MosaicPreview(..) => {}
+                Msg::Process(_) | Msg::ProcessDone(_) | Msg::Preview(_) | Msg::PreviewFailed(..) | Msg::Solved { .. } | Msg::SolveFailed(_) | Msg::ImagePrepared(..) | Msg::ImageWritten(_) | Msg::ImageProgress(_) | Msg::ImageEnhanceView(..) | Msg::ImageView(_) | Msg::ImageTiles(..) | Msg::MosaicStep(_) | Msg::MosaicDone(_) | Msg::MosaicPreview(..) => {}
                 // These come on the background channel.
                 Msg::WatchNew(..) | Msg::AutoEstimate(_) | Msg::AutoEvent(_) | Msg::AutoDone(_) | Msg::Refresh(_) | Msg::RefreshDone(_) => {}
                 Msg::Fingerprints(f) => {

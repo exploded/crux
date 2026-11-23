@@ -251,11 +251,88 @@ pub fn stars_possible(names: &[String]) -> bool {
 /// starless versions (`starnet`). Both are cached on disk; `progress` gets
 /// a short line now and then.
 pub fn for_recipe(t: &Target, out: &Path, r: &Recipe, progress: &(dyn Fn(&str) + Sync), cancel: &AtomicBool) -> Result<Target> {
-    let te = enhance::apply(t, out, &r.enhance, &|p| progress(&format!("{} {} of {}: {} {:.0}%", p.channel, p.master + 1, p.masters, p.step, p.done * 100.0)), cancel)?;
-    if r.stars.engine == stars::StarEngine::Network && r.stars.mode == stars::StarMode::Natural && stars_possible(&te.channels()) {
-        starnet::apply(&te, out, &|i, n, f| progress(&format!("removing stars {} of {}: {:.0}%", i + 1, n, f * 100.0)), cancel)
+    let passes = Passes::new(t, &r.enhance, &r.stars);
+    let te = enhance::apply(t, out, &r.enhance, &|p| progress(&passes.enhance_line(&p)), cancel)?;
+    if passes.starless {
+        let names = te.channels();
+        starnet::apply(&te, out, &|i, _, f| progress(&passes.starless_line(i, names.get(i).map(String::as_str).unwrap_or(""), f)), cancel)
     } else {
         Ok(te)
+    }
+}
+
+/// Whether `for_recipe` runs the star remover for these settings.
+pub fn wants_starless(t: &Target, st: &stars::StarSettings) -> bool {
+    st.engine == stars::StarEngine::Network && st.mode == stars::StarMode::Natural && stars_possible(&t.channels())
+}
+
+/// Progress lines for `for_recipe`'s network passes, numbered across every
+/// channel ("Pass 4 of 9 · O: correcting stars 40%"). Each step runs one
+/// channel at a time, so "H 1 of 3" alone started again at every step.
+/// Passes found in the cache are skipped, so the count can jump ahead.
+pub struct Passes {
+    masters: usize,
+    /// The enhance steps each master goes through, in order.
+    steps: Vec<&'static str>,
+    pub starless: bool,
+}
+
+impl Passes {
+    pub fn new(t: &Target, e: &enhance::EnhanceSettings, st: &stars::StarSettings) -> Passes {
+        use enhance::{Engine, Sharpen};
+        let mut steps = Vec::new();
+        if e.active() {
+            match e.engine {
+                Engine::Crux => {
+                    // The denoiser runs even for sharpening alone: the blend needs it.
+                    steps.push("denoise");
+                    match e.sharpen {
+                        Sharpen::Off => {}
+                        Sharpen::Correct => steps.push("correct"),
+                        Sharpen::Tighten => steps.push("tighten"),
+                    }
+                }
+                Engine::RcAstro => {
+                    if e.sharpen != Sharpen::Off {
+                        steps.push("BlurXTerminator");
+                    }
+                    if e.denoise {
+                        steps.push("NoiseXTerminator");
+                    }
+                }
+            }
+        }
+        Passes { masters: t.masters.len(), steps, starless: wants_starless(t, st) }
+    }
+
+    pub fn total(&self) -> usize {
+        self.masters * (self.steps.len() + self.starless as usize)
+    }
+
+    fn line(&self, pass: usize, channel: &str, what: &str, done: f32) -> String {
+        format!("Pass {} of {} · {channel}: {what} {:.0}%", pass.min(self.total()).max(1), self.total(), done * 100.0)
+    }
+
+    pub fn enhance_line(&self, p: &enhance::Progress) -> String {
+        let per = self.steps.len();
+        // Blending ends the master's last pass.
+        let k = self.steps.iter().position(|s| *s == p.step).unwrap_or(per.saturating_sub(1));
+        self.line(p.master * per + k + 1, &p.channel, &step_word(&p.step), p.done)
+    }
+
+    pub fn starless_line(&self, master: usize, channel: &str, done: f32) -> String {
+        self.line(self.masters * self.steps.len() + master + 1, channel, "removing stars", done)
+    }
+}
+
+/// A network step as the progress line says it.
+pub fn step_word(s: &str) -> String {
+    match s {
+        "denoise" => "removing noise".into(),
+        "correct" => "correcting stars".into(),
+        "tighten" => "sharpening".into(),
+        "blend" => "blending".into(),
+        other => other.to_string(),
     }
 }
 

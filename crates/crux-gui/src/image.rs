@@ -51,6 +51,16 @@ pub struct ImageUi {
     labels: (String, String),
     tiles: Vec<(String, egui::TextureHandle)>,
     tiles_key: String,
+    /// The preview renders in the background, one at a time, so sliders
+    /// never wait for it: whether one is running, and its result waiting
+    /// to become textures.
+    view_busy: bool,
+    view_pending: Option<Box<ViewDone>>,
+    /// Preset tiles likewise, started once the settings have held still
+    /// for `TILES_SETTLE` (the key and when it last changed).
+    tiles_busy: bool,
+    tiles_pending: Option<(String, Vec<(String, render::Rgb)>)>,
+    tiles_seen: (String, std::time::Instant),
     pub depth: Depth,
     /// Gradient stage: the channel shown, and whether to show its surface.
     pub gchan: usize,
@@ -116,6 +126,13 @@ impl ImageUi {
 /// Pinned layout: the share of the column the preview starts with.
 const VIEW_FRAC: f32 = 0.6;
 
+/// A preview rendered in the background: key, before, after, labels, ms.
+pub type ViewDone = (String, render::Rgb, render::Rgb, (String, String), f64);
+
+/// How long the settings must hold still before the preset tiles render
+/// again (nine renders per change made sliders stick).
+const TILES_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// The preview's height limit: the pinned layout's, else a share of the
 /// window (`frac`).
 fn max_view_h(ui: &Ui, img: &ImageUi, frac: f32) -> f32 {
@@ -153,6 +170,11 @@ impl Default for ImageUi {
             labels: (String::new(), String::new()),
             tiles: Vec::new(),
             tiles_key: String::new(),
+            view_busy: false,
+            view_pending: None,
+            tiles_busy: false,
+            tiles_pending: None,
+            tiles_seen: (String::new(), std::time::Instant::now()),
             depth: Depth::Adjust,
             gchan: 0,
             gmodel: false,
@@ -191,7 +213,7 @@ impl Default for ImageUi {
 
 impl ImageUi {
     pub fn ready_for_shot(&self) -> bool {
-        self.after.is_some() && (self.prep_key.is_empty() || self.preparing.is_none()) && !self.writing && !self.pending_write || self.error.is_some()
+        self.after.is_some() && (self.prep_key.is_empty() || self.preparing.is_none()) && !self.writing && !self.pending_write && !self.view_busy && self.view_pending.is_none() && !self.tiles_busy && self.tiles_pending.is_none() || self.error.is_some()
     }
 
     /// Preparing, enhancing or writing in the background (files in the
@@ -208,6 +230,14 @@ impl ImageUi {
     pub fn handle(&mut self, m: Msg) -> Option<Msg> {
         match m {
             Msg::ImageProgress(t) => self.progress = Some(t),
+            Msg::ImageView(v) => {
+                self.view_busy = false;
+                self.view_pending = Some(v);
+            }
+            Msg::ImageTiles(key, t) => {
+                self.tiles_busy = false;
+                self.tiles_pending = Some((key, t));
+            }
             Msg::ImageEnhanceView(key, r) => {
                 self.enh_loading = None;
                 self.enh_pending = Some((key, r));
@@ -304,33 +334,23 @@ fn enhance_key(e: &render::enhance::EnhanceSettings) -> String {
 }
 
 /// Sharpen and denoise the masters (cached on disk), reporting progress.
-fn enhanced(t: &Target, out: &std::path::Path, e: &render::enhance::EnhanceSettings, tx: &Sender<Msg>, ctx: &egui::Context, cancel: &AtomicBool) -> anyhow::Result<Target> {
+fn enhanced(t: &Target, out: &std::path::Path, e: &render::enhance::EnhanceSettings, passes: &render::Passes, tx: &Sender<Msg>, ctx: &egui::Context, cancel: &AtomicBool) -> anyhow::Result<Target> {
     render::enhance::apply(t, out, e, &|p| {
-        let _ = tx.send(Msg::ImageProgress(format!("{} {} of {}: {} {:.0}%", p.channel, p.master + 1, p.masters, step_word(&p.step), p.done * 100.0)));
+        let _ = tx.send(Msg::ImageProgress(passes.enhance_line(&p)));
         ctx.request_repaint();
     }, cancel)
 }
 
 /// The star remover's starless masters, when chosen for natural colours.
-fn with_starless(t: Target, out: &std::path::Path, st: &render::stars::StarSettings, tx: &Sender<Msg>, ctx: &egui::Context, cancel: &AtomicBool) -> anyhow::Result<Target> {
-    if st.engine != render::stars::StarEngine::Network || st.mode != render::stars::StarMode::Natural || !render::stars_possible(&t.channels()) {
+fn with_starless(t: Target, out: &std::path::Path, passes: &render::Passes, tx: &Sender<Msg>, ctx: &egui::Context, cancel: &AtomicBool) -> anyhow::Result<Target> {
+    if !passes.starless {
         return Ok(t);
     }
     let names = t.channels();
-    render::starnet::apply(&t, out, &|i, n, f| {
-        let _ = tx.send(Msg::ImageProgress(format!("{} {} of {}: removing stars {:.0}%", names.get(i).cloned().unwrap_or_default(), i + 1, n, f * 100.0)));
+    render::starnet::apply(&t, out, &|i, _, f| {
+        let _ = tx.send(Msg::ImageProgress(passes.starless_line(i, names.get(i).map(String::as_str).unwrap_or(""), f)));
         ctx.request_repaint();
     }, cancel)
-}
-
-fn step_word(s: &str) -> String {
-    match s {
-        "denoise" => "denoising".into(),
-        "correct" => "correcting stars".into(),
-        "tighten" => "sharpening".into(),
-        "blend" => "blending".into(),
-        other => other.to_string(),
-    }
 }
 
 /// Run a preview render on the UI thread's own rayon pool. On the global
@@ -419,8 +439,9 @@ pub fn tick(a: &mut UiState, s: &Session, tx: &Sender<Msg>, ctx: &egui::Context)
             .spawn(move || {
                 // Sharpened and denoised masters first (cached), then the
                 // prepared target from `prepared.cache` when nothing changed.
-                let res = enhanced(&t2, &out2, &enh, &tx, &ctx2, &cancel)
-                    .and_then(|te| with_starless(te, &out2, &stars, &tx, &ctx2, &cancel))
+                let passes = render::Passes::new(&t2, &enh, &stars);
+                let res = enhanced(&t2, &out2, &enh, &passes, &tx, &ctx2, &cancel)
+                    .and_then(|te| with_starless(te, &out2, &passes, &tx, &ctx2, &cancel))
                     .and_then(|te| render::prepcache::prepare(&te, &out2, &g, &stars, &cancel))
                     .map(Arc::new)
                     .map_err(|e| format!("{e:#}"));
@@ -442,6 +463,19 @@ pub fn tick(a: &mut UiState, s: &Session, tx: &Sender<Msg>, ctx: &egui::Context)
     if st == Stage::Enhance {
         enhance_tick(img, &t, &out, tx, ctx);
     }
+    // Background renders that have landed become textures.
+    if let Some(v) = img.view_pending.take() {
+        let (key, before, after, labels, ms) = *v;
+        img.view_key = key;
+        img.render_ms = ms;
+        img.before = Some(tex(ctx, "img-before", &before));
+        img.after = Some(tex(ctx, "img-after", &after));
+        img.labels = labels;
+    }
+    if let Some((key, rendered)) = img.tiles_pending.take() {
+        img.tiles_key = key;
+        img.tiles = rendered.iter().map(|(n, rgb)| (n.clone(), tex(ctx, &format!("tile-{n}"), rgb))).collect();
+    }
     // An older preparation stays on screen until the new one lands.
     let Some(p) = img.prepared.clone() else { return };
     if let Some(name) = img.pending_preset.take() {
@@ -461,78 +495,105 @@ pub fn tick(a: &mut UiState, s: &Session, tx: &Sender<Msg>, ctx: &egui::Context)
     let mut rk = r.clone();
     rk.crop = None;
     let vk = format!("{:?}|{}|{}|{}|{}|{}|{}", st, img.prep_key, serde_json::to_string(&rk).unwrap_or_default(), img.gchan, img.gmodel, img.sview, p.channels.len());
-    if vk != img.view_key {
-        img.view_key = vk;
-        let t0 = std::time::Instant::now();
+    // One render at a time, off the UI thread, always from the settings as
+    // they are when it starts: a slider drag shows the latest position as
+    // soon as the render before it ends, and the slider itself never waits.
+    if vk != img.view_key && !img.view_busy {
+        img.view_busy = true;
         let (gmodel, gchan, sview) = (img.gmodel, img.gchan, img.sview);
-        let (before, after, labels) = quick(|| match st {
-            Stage::Enhance => {
-                let v = render::linear_view(&p, false);
-                (v.clone(), v, (String::new(), String::new()))
-            }
-            Stage::Gradient => {
-                let b = render::linear_view(&p, false);
-                let a2 = if gmodel {
-                    let c = &p.channels[gchan.min(p.channels.len() - 1)];
-                    match &c.model {
-                        Some(m) => {
-                            let (w, h) = (c.raw_proxy.width, c.raw_proxy.height);
-                            let surf = m.render(w, h);
-                            // Its own range, so a few per cent of tilt shows.
-                            let (lo, hi) = surf.data.iter().fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
-                            let k = if hi > lo { 0.7 / (hi - lo) } else { 0.0 };
-                            let v: Vec<f32> = surf.data.iter().map(|x| 0.15 + (x - lo) * k).collect();
-                            render::Rgb { width: w, height: h, r: v.clone(), g: v.clone(), b: v }
-                        }
-                        None => render::linear_view(&p, true),
-                    }
-                } else {
-                    render::linear_view(&p, true)
-                };
-                let right = if gmodel {
-                    let c = &p.channels[gchan.min(p.channels.len() - 1)];
-                    format!("{} background surface, {:.1}% across (contrast stretched)", c.name, c.report.as_ref().map(|g| g.amplitude_frac * 100.0).unwrap_or(0.0))
-                } else {
-                    "Gradient removed".into()
-                };
-                (b, a2, ("Before".to_string(), right))
-            }
-            Stage::Palette => (render::linear_view(&p, true), render::render_proxy(&p, &kept(&unfinished(&r))), ("Linear, auto-stretched".to_string(), "Mixed and stretched".to_string())),
-            Stage::Stars => {
-                let k = kept(&r);
-                match sview {
-                    1 => (render::render_crop(&p, &k), render::render_crop(&p, &r), ("Stars as mixed, 1:1".to_string(), "Natural star colours, 1:1".to_string())),
-                    2 => (render::render_proxy(&p, &k), render::render_starless(&p, &r).unwrap_or_else(|| render::render_proxy(&p, &k)), ("Stars as mixed".to_string(), "Starless mix".to_string())),
-                    _ => (render::render_proxy(&p, &k), render::render_proxy(&p, &r), ("Stars as mixed".to_string(), "Natural star colours".to_string())),
+        let (p, r, tx, ctx) = (p.clone(), r.clone(), tx.clone(), ctx.clone());
+        let spawned = std::thread::Builder::new().name("crux-preview".into()).spawn(move || {
+            let t0 = std::time::Instant::now();
+            let (before, after, labels) = quick(|| match st {
+                Stage::Enhance => {
+                    let v = render::linear_view(&p, false);
+                    (v.clone(), v, (String::new(), String::new()))
                 }
-            }
-            Stage::Crop => {
-                let f = render::render_proxy(&p, &r);
-                (f.clone(), f, (String::new(), String::new()))
-            }
-            _ => (render::render_proxy(&p, &kept(&unfinished(&r))), render::render_proxy(&p, &kept(&r)), ("Before finishing".to_string(), "Finished".to_string())),
+                Stage::Gradient => {
+                    let b = render::linear_view(&p, false);
+                    let a2 = if gmodel {
+                        let c = &p.channels[gchan.min(p.channels.len() - 1)];
+                        match &c.model {
+                            Some(m) => {
+                                let (w, h) = (c.raw_proxy.width, c.raw_proxy.height);
+                                let surf = m.render(w, h);
+                                // Its own range, so a few per cent of tilt shows.
+                                let (lo, hi) = surf.data.iter().fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+                                let k = if hi > lo { 0.7 / (hi - lo) } else { 0.0 };
+                                let v: Vec<f32> = surf.data.iter().map(|x| 0.15 + (x - lo) * k).collect();
+                                render::Rgb { width: w, height: h, r: v.clone(), g: v.clone(), b: v }
+                            }
+                            None => render::linear_view(&p, true),
+                        }
+                    } else {
+                        render::linear_view(&p, true)
+                    };
+                    let right = if gmodel {
+                        let c = &p.channels[gchan.min(p.channels.len() - 1)];
+                        format!("{} background surface, {:.1}% across (contrast stretched)", c.name, c.report.as_ref().map(|g| g.amplitude_frac * 100.0).unwrap_or(0.0))
+                    } else {
+                        "Gradient removed".into()
+                    };
+                    (b, a2, ("Before".to_string(), right))
+                }
+                Stage::Palette => (render::linear_view(&p, true), render::render_proxy(&p, &kept(&unfinished(&r))), ("Linear, auto-stretched".to_string(), "Mixed and stretched".to_string())),
+                Stage::Stars => {
+                    let k = kept(&r);
+                    match sview {
+                        1 => (render::render_crop(&p, &k), render::render_crop(&p, &r), ("Stars as mixed, 1:1".to_string(), "Natural star colours, 1:1".to_string())),
+                        2 => (render::render_proxy(&p, &k), render::render_starless(&p, &r).unwrap_or_else(|| render::render_proxy(&p, &k)), ("Stars as mixed".to_string(), "Starless mix".to_string())),
+                        _ => (render::render_proxy(&p, &k), render::render_proxy(&p, &r), ("Stars as mixed".to_string(), "Natural star colours".to_string())),
+                    }
+                }
+                Stage::Crop => {
+                    let f = render::render_proxy(&p, &r);
+                    (f.clone(), f, (String::new(), String::new()))
+                }
+                _ => (render::render_proxy(&p, &kept(&unfinished(&r))), render::render_proxy(&p, &kept(&r)), ("Before finishing".to_string(), "Finished".to_string())),
+            });
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let _ = tx.send(Msg::ImageView(Box::new((vk, before, after, labels, ms))));
+            ctx.request_repaint();
         });
-        img.render_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        img.before = Some(tex(ctx, "img-before", &before));
-        img.after = Some(tex(ctx, "img-after", &after));
-        img.labels = labels;
+        if spawned.is_err() {
+            img.view_busy = false;
+        }
     }
-    // Preset tiles, rendered from this target with the current stretch.
+    // Preset tiles, rendered from this target with the current stretch,
+    // once the settings hold still (nine renders per slider step stuck the
+    // sliders) and after the preview.
     if st == Stage::Palette {
         let tk = format!("{}|{}|{}", img.prep_key, serde_json::to_string(&r.stretch).unwrap_or_default(), serde_json::to_string(&r.finish).unwrap_or_default());
-        if tk != img.tiles_key {
-            img.tiles_key = tk;
-            let rendered: Vec<(String, render::Rgb)> = quick(|| {
-                palette::presets(p.kind, &p.names())
-                    .iter()
-                    .map(|pr| {
-                        let mut rr = r.clone();
-                        rr.apply_preset(pr, &p.names());
-                        (pr.name.to_string(), render::render_tile(&p, &rr, TILE))
-                    })
-                    .collect()
-            });
-            img.tiles = rendered.iter().map(|(n, rgb)| (n.clone(), tex(ctx, &format!("tile-{n}"), rgb))).collect();
+        if tk != img.tiles_seen.0 {
+            img.tiles_seen = (tk.clone(), std::time::Instant::now());
+        }
+        if tk != img.tiles_key && !img.tiles_busy {
+            let waited = img.tiles_seen.1.elapsed();
+            // The first tiles for a target don't wait.
+            let first = img.tiles.is_empty();
+            if (first || waited >= TILES_SETTLE) && !img.view_busy {
+                img.tiles_busy = true;
+                let (p, r, tx, ctx) = (p.clone(), r.clone(), tx.clone(), ctx.clone());
+                let spawned = std::thread::Builder::new().name("crux-tiles".into()).spawn(move || {
+                    let rendered: Vec<(String, render::Rgb)> = quick(|| {
+                        palette::presets(p.kind, &p.names())
+                            .iter()
+                            .map(|pr| {
+                                let mut rr = r.clone();
+                                rr.apply_preset(pr, &p.names());
+                                (pr.name.to_string(), render::render_tile(&p, &rr, TILE))
+                            })
+                            .collect()
+                    });
+                    let _ = tx.send(Msg::ImageTiles(tk, rendered));
+                    ctx.request_repaint();
+                });
+                if spawned.is_err() {
+                    img.tiles_busy = false;
+                }
+            } else {
+                ctx.request_repaint_after(TILES_SETTLE.saturating_sub(waited).max(std::time::Duration::from_millis(30)));
+            }
         }
     }
     if img.pending_write && !img.writing {

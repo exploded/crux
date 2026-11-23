@@ -59,8 +59,12 @@ pub struct EnhanceSettings {
 }
 
 impl Default for EnhanceSettings {
+    /// Correct star shapes and remove noise (James, 2026-11-23) when the
+    /// build has crux's networks; off without them. Recipes save every
+    /// field, so ones written earlier keep what they had.
     fn default() -> Self {
-        EnhanceSettings { engine: Engine::Crux, sharpen: Sharpen::Off, sharpen_amount: 1.0, denoise: false, denoise_amount: 0.8 }
+        let on = cfg!(feature = "ml");
+        EnhanceSettings { engine: Engine::Crux, sharpen: if on { Sharpen::Correct } else { Sharpen::Off }, sharpen_amount: 1.0, denoise: on, denoise_amount: 0.8 }
     }
 }
 
@@ -338,7 +342,7 @@ mod tests {
     fn settings_describe_and_round_trip() {
         let s = EnhanceSettings { denoise: true, sharpen: Sharpen::Correct, ..Default::default() };
         assert_eq!(s.describe(), "correct stars 100%, denoise 80% (crux)");
-        assert!(!EnhanceSettings::default().active());
+        assert_eq!(EnhanceSettings::default().active(), cfg!(feature = "ml"));
         let t = toml::to_string(&s).unwrap();
         let back: EnhanceSettings = toml::from_str(&t).unwrap();
         assert_eq!(back, s);
@@ -364,7 +368,7 @@ mod tests {
         let master = dir.join("m.xisf");
         crate::xisf::write_image(&master, &Image::from_data(w, h, data), &Header::default(), None).unwrap();
         let t = Target { object: "Test".into(), masters: vec![super::super::Master { channel: "L".into(), filter: "L".into(), path: master.clone(), frames: 3, exposure: 900.0, starless: None, noise: 0.0 }] };
-        let s = EnhanceSettings { denoise: true, denoise_amount: 1.0, ..Default::default() };
+        let s = EnhanceSettings { denoise: true, denoise_amount: 1.0, sharpen: Sharpen::Off, ..Default::default() };
         let e = apply(&t, &dir, &s, &|_| {}, &AtomicBool::new(false)).unwrap();
         let full = crate::read_image(&e.masters[0].path).unwrap();
         let s2 = EnhanceSettings { denoise_amount: 0.5, ..s.clone() };
