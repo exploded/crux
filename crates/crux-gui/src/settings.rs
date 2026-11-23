@@ -108,6 +108,8 @@ pub fn show(ui: &mut Ui, a: &mut UiState, s: Option<&mut Session>) {
         ui.add_space(10.0);
         addons(ui, &p, st, &mut d);
         ui.add_space(10.0);
+        updates(ui, &p, &mut d, &def);
+        ui.add_space(10.0);
         go_fresh = crate::fresh::card(ui, &p, fresh, busy, ixp.as_deref(), explicit.as_deref(), &fresh_cfg);
         ui.add_space(10.0);
     });
@@ -125,6 +127,14 @@ pub fn show(ui: &mut Ui, a: &mut UiState, s: Option<&mut Session>) {
                     d.tools.apply();
                     a.stack.img.recheck_tools();
                     let old = std::mem::replace(&mut st.saved, d.clone());
+                    if old.updates.check != d.updates.check {
+                        if d.updates.check {
+                            let c = ui.ctx().clone();
+                            crux_core::update::start(true, false, move || c.request_repaint());
+                        } else {
+                            crux_core::update::turn_off();
+                        }
+                    }
                     st.file = Some(path);
                     st.error = None;
                     st.note = Some(match (s, &own_file) {
@@ -502,5 +512,61 @@ fn site(ui: &mut Ui, p: &Pal, d: &mut Config, def: &Config) {
             number(ui, p, "Camera gain", "Electrons per ADU, when EGAIN is missing.", &mut d.camera.egain, def.camera.egain, 0.01..=20.0, 0.001, 3, " e-/ADU");
             number(ui, p, "Expected bias level", "The bias offset you usually shoot at, in ADU. Bias sets more than 50 ADU from it are flagged.", &mut d.camera.bias_level_adu, def.camera.bias_level_adu, 0.0..=65535.0, 1.0, 0, " ADU");
         });
+    });
+}
+
+fn updates(ui: &mut Ui, p: &Pal, d: &mut Config, def: &Config) {
+    use crux_core::update::{self, Status};
+    w::card(ui, p, |ui| {
+        w::h2(ui, "Updates");
+        w::muted(ui, p, "crux asks GitHub for its latest release, at most once a day. Nothing about you or your images is sent.");
+        ui.add_space(6.0);
+        grid(ui, "set-updates", |ui| {
+            // Written out rather than `check`: this grid has no wide control,
+            // so the checkbox column is padded to line up with the other cards.
+            label(ui, "Check for updates when crux starts", "When a newer crux is out, the top bar shows an Update button that opens its download page. crux never downloads or installs anything itself.");
+            ui.horizontal(|ui| {
+                ui.set_min_width(CONTROL_W);
+                ui.checkbox(&mut d.updates.check, "");
+            });
+            ui.horizontal(|ui| {
+                if source(ui, p, d.updates.check != def.updates.check) {
+                    d.updates.check = def.updates.check;
+                }
+            });
+            ui.end_row();
+        });
+        ui.add_space(6.0);
+        let st = update::status();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("crux {}", update::current())).font(body(13.0))).on_hover_text("The version you're running.");
+            ui.add_space(10.0);
+            let busy = st == Status::Checking;
+            if w::button_enabled(ui, p, "Check now", Kind::Normal, None, update::in_build() && !busy).clicked() {
+                let c = ui.ctx().clone();
+                update::start(true, true, move || c.request_repaint());
+            }
+            let when = |t: &chrono::DateTime<chrono::Local>| t.format("%-d %b %H:%M").to_string();
+            let (text, col) = match &st {
+                Status::NotChecked => ("Not checked yet.".to_string(), p.muted),
+                Status::Off => ("Not checked: turned off.".to_string(), p.muted),
+                Status::NotInBuild => ("This build has no update check.".to_string(), p.muted),
+                Status::Checking => ("Checking…".to_string(), p.muted),
+                Status::UpToDate { latest, checked } => (format!("Up to date: the latest release is {latest} (checked {}).", when(checked)), p.good),
+                Status::Newer { release, checked } => (format!("crux {} is out (checked {}).", release.version, when(checked)), p.accent),
+                Status::Failed(e) => (format!("Couldn't check: {e}"), p.rej),
+            };
+            ui.label(RichText::new(text).font(body(12.0)).color(col));
+            if let Status::Newer { release, .. } = &st {
+                if w::button(ui, p, "Open download page", Kind::Primary, None).clicked() {
+                    let _ = crate::stack::open_url(&release.url);
+                }
+            }
+        });
+        // Screenshot harness: `CRUX_GUI_OPTS=set-updates` scrolls here.
+        static SHOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *SHOW.get_or_init(|| std::env::var_os("CRUX_GUI_SHOT").is_some() && std::env::var("CRUX_GUI_OPTS").is_ok_and(|o| o.split(',').any(|x| x.trim() == "set-updates"))) {
+            ui.scroll_to_cursor(Some(egui::Align::Max));
+        }
     });
 }

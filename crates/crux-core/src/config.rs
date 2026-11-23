@@ -26,6 +26,8 @@ pub struct Config {
     pub gpu: GpuSettings,
     /// Other programs crux can use: ASTAP's star database, RC Astro's CLI.
     pub tools: Tools,
+    /// Whether the app looks for a newer release (see `update`).
+    pub updates: Updates,
 }
 
 impl Default for Config {
@@ -44,6 +46,7 @@ impl Default for Config {
             mosaic: Default::default(),
             gpu: GpuSettings::default(),
             tools: Tools::default(),
+            updates: Updates::default(),
         }
     }
 }
@@ -67,6 +70,21 @@ impl Tools {
     pub fn apply(&self) {
         crate::catalog::set_folder(self.catalog.clone());
         crate::rcastro::set_path(self.rc_astro.clone());
+    }
+}
+
+/// The desktop app's update check (see `update`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Updates {
+    /// Ask GitHub for the latest release when the app starts, at most
+    /// once a day.
+    pub check: bool,
+}
+
+impl Default for Updates {
+    fn default() -> Self {
+        Updates { check: true }
     }
 }
 

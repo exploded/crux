@@ -50,6 +50,7 @@ pub mod targets;
 pub mod timing;
 pub mod trails;
 pub mod transparency;
+pub mod update;
 pub mod watch;
 pub mod xisf;
 

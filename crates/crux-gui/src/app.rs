@@ -307,6 +307,15 @@ impl App {
             crux_core::gpu::open();
             c.request_repaint();
         });
+        // Is there a newer crux? At most once a day (`update`). Harness runs
+        // don't ask, unless they pretend to be an older version to show
+        // the notice.
+        let c = ctx.clone();
+        std::thread::spawn(move || {
+            let on = crux_core::config::Config::load(None, None).map(|(cfg, _)| cfg.updates.check).unwrap_or(true);
+            let harness = std::env::var_os("CRUX_GUI_SHOT").is_some() && std::env::var_os("CRUX_UPDATE_PRETEND_VERSION").is_none();
+            crux_core::update::start(on && !harness, false, move || c.request_repaint());
+        });
         if let Some(d) = app.args.dir.clone() {
             app.open(ctx, d);
         }
@@ -1322,6 +1331,7 @@ impl App {
                     self.drawer = !self.drawer;
                 }
                 self.compute_badge(ui);
+                self.update_badge(ui);
             });
         });
     }
@@ -1347,6 +1357,22 @@ impl App {
         pa.galley(Pos2::new(r.left() + 29.0, r.center().y - g.size().y / 2.0), g, col);
         if resp.on_hover_text(format!("{tip}. Change it in Settings.")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
             self.ui.view = View::Settings;
+        }
+    }
+
+    /// Shown only when a newer crux is out: click for its download page.
+    fn update_badge(&mut self, ui: &mut egui::Ui) {
+        let crux_core::update::Status::Newer { release, .. } = crux_core::update::status() else { return };
+        let p = self.ui.pal;
+        let g = ui.painter().layout_no_wrap(format!("Update {}", release.version), semibold(11.5), p.accent);
+        let (r, resp) = ui.allocate_exact_size(Vec2::new(g.size().x + 40.0, 30.0), Sense::click());
+        let pa = ui.painter();
+        pa.rect(r, CornerRadius::same(15), if resp.hovered() { p.panel2 } else { Color32::TRANSPARENT }, Stroke::new(1.0, p.accent), StrokeKind::Inside);
+        draw_icon(pa, Icon::Download, Rect::from_center_size(Pos2::new(r.left() + 17.0, r.center().y), Vec2::splat(15.0)), p.accent);
+        pa.galley(Pos2::new(r.left() + 29.0, r.center().y - g.size().y / 2.0), g, p.accent);
+        let tip = format!("crux {} is out (you have {}). Click to open the download page.", release.version, crux_core::update::current());
+        if resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            let _ = crate::stack::open_url(&release.url);
         }
     }
 
@@ -1567,6 +1593,7 @@ enum Icon {
     Settings,
     Keyboard,
     Chip,
+    Download,
 }
 
 /// The mockup's rail icons, drawn on a 24-unit grid.
@@ -1642,6 +1669,12 @@ fn draw_icon(pa: &egui::Painter, icon: Icon, r: Rect, c: Color32) {
                 poly(&[(2.5, k), (6.0, k)], false);
                 poly(&[(18.0, k), (21.5, k)], false);
             }
+        }
+        Icon::Download => {
+            // An arrow down onto a tray.
+            poly(&[(12.0, 3.5), (12.0, 15.0)], false);
+            poly(&[(7.0, 10.5), (12.0, 15.5), (17.0, 10.5)], false);
+            poly(&[(4.0, 16.0), (4.0, 20.0), (20.0, 20.0), (20.0, 16.0)], false);
         }
     }
 }

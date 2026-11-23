@@ -909,6 +909,22 @@ pub fn open_folder(p: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
+/// Open a web page in the default browser.
+pub fn open_url(url: &str) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer").arg(url).spawn().map(|_| ())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).spawn().map(|_| ())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(url).spawn().map(|_| ())
+    }
+}
+
 /// Open the file manager on a file's folder with the file selected.
 pub fn show_in_folder(p: &std::path::Path) -> std::io::Result<()> {
     #[cfg(windows)]

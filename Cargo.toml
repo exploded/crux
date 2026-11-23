@@ -27,6 +27,9 @@ clap = { version = "4", features = ["derive", "env"] }
 sha2 = "0.10"
 dirs = "6"
 rusqlite = { version = "0.37", features = ["bundled"] }
+semver = "1"
+# The update check (rustls; its `ring` compiles C).
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [profile.release]
 debug = 1

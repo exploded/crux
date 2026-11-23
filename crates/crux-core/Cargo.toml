@@ -22,6 +22,7 @@ lz4_flex.workspace = true
 toml.workspace = true
 sha2.workspace = true
 dirs.workspace = true
+semver.workspace = true
 png = "0.17"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 rusqlite = { workspace = true, optional = true }
@@ -29,9 +30,10 @@ tract-onnx = { version = "0.23", optional = true }
 wgpu = { version = "30", optional = true, default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "wgsl"] }
 pollster = { version = "1", optional = true }
 bytemuck = { version = "1", optional = true, features = ["derive"] }
+ureq = { workspace = true, optional = true }
 
 [features]
-default = ["sqlite", "ml", "gpu"]
+default = ["sqlite", "ml", "gpu", "update"]
 # The library index in SQLite (compiles SQLite's C source). Without it the
 # index is JSON; `build.bat platforms` checks that way (no cross C compiler).
 sqlite = ["dep:rusqlite"]
@@ -42,3 +44,6 @@ ml = ["dep:tract-onnx"]
 # networks (with `ml`), warps. Everything falls back to the CPU when no
 # suitable adapter is found or it fails.
 gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+# Ask GitHub whether a newer crux has been released (`update`). rustls's
+# `ring` compiles C, so `build.bat platforms` checks without it.
+update = ["dep:ureq"]

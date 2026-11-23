@@ -28,6 +28,11 @@ The builds aren't signed, so the first run needs one extra step:
   and newer), and a Vulkan driver to use the graphics card (`mesa-vulkan-drivers`
   on Debian and Ubuntu, or your GPU vendor's driver).
 
+When a newer release is out, the app shows an **Update** button in its top
+bar that opens the release's download page. It asks GitHub at most once a
+day and sends nothing but crux's version; turn it off in Settings, under
+Updates.
+
 ## What it does
 
 - **Triage:** reads FITS, XISF and Canon CR2 files, and classifies each one
@@ -151,6 +156,8 @@ The binaries are in `target/release`.
 - `sqlite`: the library index and flat library, in SQLite (bundled, so it
   needs a C compiler). Without it, the index falls back to JSON and there's
   no flat library.
+- `update`: the app's check for a newer release on GitHub (ureq with rustls,
+  which needs a C compiler for `ring`).
 
 ### Command line
 
@@ -211,7 +218,8 @@ timezone = "Australia/Melbourne"
 ```
 
 To always compute on the CPU, set `use = "off"` under `[gpu]` (or the
-environment variable `CRUX_GPU=off`).
+environment variable `CRUX_GPU=off`). To stop the app checking for updates,
+set `check = false` under `[updates]` (or `CRUX_UPDATE_CHECK=off`).
 
 crux reads your data folders in place and changes them only through moves
 you approve. Its caches and library index are in `%LOCALAPPDATA%\crux`
