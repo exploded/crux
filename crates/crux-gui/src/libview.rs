@@ -25,9 +25,10 @@ pub struct LibView {
     /// The folder is one of the library folders (`[library] search`).
     pub configured: bool,
     pub library: Option<crux_core::library::Library>,
-    /// Unit path key → its picture (crux's image, else a JPG/PNG in it).
+    /// Target folder key (`Unit::folder_for`) → its picture (crux's image,
+    /// else a JPG/PNG in it).
     pub images: HashMap<String, PathBuf>,
-    /// Unit path key → what crux has made for it in the workspace.
+    /// Target folder key → what crux has made for it in the workspace.
     pub made: HashMap<String, Made>,
 }
 
@@ -64,7 +65,7 @@ pub fn made(dir: &Path, workspace: &Path) -> Option<Made> {
 
 /// A card's status from what's been made: green once an image is newer
 /// than every master.
-fn made_status(m: &Made, p: &crate::theme::Pal) -> (Option<egui::Color32>, String) {
+pub fn made_status(m: &Made, p: &crate::theme::Pal) -> (Option<egui::Color32>, String) {
     let day = |t: std::time::SystemTime| chrono::DateTime::<chrono::Local>::from(t).date_naive();
     let masters = format!("{} master{}", m.masters, if m.masters == 1 { "" } else { "s" });
     match m.image_at {
@@ -315,6 +316,7 @@ pub fn show(ui: &mut egui::Ui, a: &mut UiState) {
     }
 
     if let Some(o) = open {
+        a.from_library = Some(root.clone());
         a.open_request = Some(o);
     }
     if add_root {
@@ -352,7 +354,8 @@ pub fn show(ui: &mut egui::Ui, a: &mut UiState) {
 fn card_for(t: &crux_core::targets::Target, v: &LibView, p: &crate::theme::Pal) -> Target {
     let lt = &v.targets;
     let units: Vec<&crux_core::targets::Unit> = t.units.iter().map(|&u| &lt.units[u]).collect();
-    let image = units.iter().rev().find_map(|u| v.images.get(&crux_core::paths::key(&u.path)).cloned());
+    let key = |u: &crux_core::targets::Unit| crux_core::paths::key(u.folder_for(&t.name));
+    let image = units.iter().rev().find_map(|u| v.images.get(&key(u)).cloned());
     let span = match (t.nights.first(), t.nights.last()) {
         (Some(a), Some(b)) if a.year() != b.year() => format!("{}–{}", a.format("%b %Y"), b.format("%b %Y")),
         (Some(a), Some(b)) if a.month() != b.month() => format!("{}–{}", a.format("%b"), b.format("%b %Y")),
@@ -366,7 +369,7 @@ fn card_for(t: &crux_core::targets::Target, v: &LibView, p: &crate::theme::Pal) 
         t.nights.len(),
         if t.nights.len() == 1 { "" } else { "s" }
     );
-    let made = units.first().and_then(|u| v.made.get(&crux_core::paths::key(&u.path)));
+    let made = units.first().and_then(|u| v.made.get(&key(u)));
     let status = if units.len() > 1 {
         (Some(p.warn), format!("in {} folders", units.len()))
     } else if let Some(m) = made {
@@ -381,12 +384,12 @@ fn card_for(t: &crux_core::targets::Target, v: &LibView, p: &crate::theme::Pal) 
         .units
         .iter()
         .max_by_key(|&&u| (lt.units[u].targets.get(&t.name).copied().unwrap_or(0), u))
-        .map(|&u| lt.units[u].path.clone());
+        .map(|&u| lt.units[u].folder_for(&t.name).to_path_buf());
     Target { name: t.name.clone(), sub, secs: t.secs.clone(), status, image, thumb: None, open, is_current: false }
 }
 
 /// Add a folder to `[library] search` in the per-user crux.toml.
-fn add_library_folder(dir: &Path) -> anyhow::Result<PathBuf> {
+pub fn add_library_folder(dir: &Path) -> anyhow::Result<PathBuf> {
     let (mut c, _) = Config::load(None, None)?;
     // An empty list means "the folder holding the library root": keep it.
     let mut roots = if c.library.search.is_empty() { c.library.search_roots() } else { c.library.search.clone() };

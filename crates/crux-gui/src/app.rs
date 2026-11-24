@@ -110,6 +110,13 @@ pub struct UiState {
     /// The open folder's finished image: None until the worker has looked,
     /// then Some(None) when it has none.
     pub target_image: Option<Option<PathBuf>>,
+    /// What crux has made for the open folder (masters, image), looked up
+    /// every few seconds while Home shows it: (when, folder, result).
+    pub target_made: Option<(f64, PathBuf, Option<crate::libview::Made>)>,
+    /// The library folder a target was last opened from, so the way back
+    /// works for folders that look like a library but aren't one of your
+    /// library folders yet.
+    pub from_library: Option<PathBuf>,
     pub facts: Option<HeaderFacts>,
     pub progress: Option<(Stage, usize, usize)>,
     pub loading: Option<PathBuf>,
@@ -260,6 +267,8 @@ impl App {
                 folders: Vec::new(),
                 folders_s: 0.0,
                 target_image: None,
+                target_made: None,
+                from_library: crate::last_library(),
                 facts: None,
                 progress: None,
                 loading: None,
@@ -369,11 +378,16 @@ impl App {
         // The old folder's neighbours, until the new folder's arrive.
         self.ui.folders.clear();
         self.ui.target_image = None;
+        self.ui.target_made = None;
         self.ui.lib.view = None;
         self.ui.lib.error = None;
         let job = OpenJob { cache_dir: Some(self.cache_dir_for(&dir)), library: self.args.library.clone(), index, root: dir.clone(), cancel: self.ui.cancel.clone() };
         worker::spawn_open(job, self.tx.clone(), ctx.clone());
-        crate::remember_folder(&dir);
+        // Forget the library once you've gone somewhere outside it.
+        if self.ui.from_library.as_ref().is_some_and(|l| !crux_core::library::inside(&dir, l)) {
+            self.ui.from_library = None;
+        }
+        crate::remember_folder(&dir, self.ui.from_library.as_deref());
     }
 
     fn drop_resident(&mut self) {
@@ -422,6 +436,11 @@ impl App {
                     self.ui.fu.night = None;
                     self.ui.loading = None;
                     self.session = Some(s);
+                }
+                Msg::LibraryGuess(p) => {
+                    if self.ui.from_library.is_none() {
+                        self.ui.from_library = Some(p);
+                    }
                 }
                 Msg::LibraryView(v) => {
                     self.ui.loading = None;
@@ -1248,7 +1267,7 @@ impl App {
                     // The parent opens on click when it's one of your
                     // library folders (or inside one): back to the library.
                     let cfg = self.session.as_ref().map(|s| &s.cfg).or(self.ui.lib.view.as_ref().map(|v| &v.cfg));
-                    let lib_parent = cfg.and_then(|c| crate::worker::library_parent(r, c));
+                    let lib_parent = cfg.and_then(|c| crate::worker::back_to_library(r, c, self.ui.from_library.as_deref()));
                     let parent = r.parent().map(|x| x.display().to_string()).unwrap_or_default();
                     let name = r.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                     match &lib_parent {

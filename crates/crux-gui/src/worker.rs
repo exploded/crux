@@ -12,7 +12,7 @@ use crux_core::pipeline::{self, Stage, Triage};
 use crux_core::transparency::FrameTransparency;
 use crux_core::{FrameType, Role};
 use eframe::egui;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -50,6 +50,8 @@ pub enum Msg {
     Folders(Vec<FolderSummary>, f64),
     /// The open folder's finished image, if it has one (decoded next).
     TargetImage(Option<PathBuf>),
+    /// The open folder's parent looks like a library (`looks_like_library_dir`).
+    LibraryGuess(PathBuf),
     Gallery(PathBuf, egui::ColorImage),
     /// The library index (every folder) and each folder's space.
     /// `area`: the folder Library health measured (the library folder
@@ -131,6 +133,13 @@ fn open(job: &OpenJob, tx: &Sender<Msg>, ctx: &egui::Context) -> anyhow::Result<
     if let Some(l) = &job.library {
         cfg.library.use_folder(l);
     }
+    // A target folder opened directly, inside a folder of several targets
+    // that isn't one of your library folders: offer the way back anyway.
+    if library_parent(root, &cfg).is_none() {
+        if let Some(parent) = root.parent().filter(|p| looks_like_library_dir(p)) {
+            let _ = tx.send(Msg::LibraryGuess(parent.to_path_buf()));
+        }
+    }
     let mut cache = match &job.cache_dir {
         Some(d) => Cache::load(d),
         None => Cache::disabled(),
@@ -151,12 +160,15 @@ fn open(job: &OpenJob, tx: &Sender<Msg>, ctx: &egui::Context) -> anyhow::Result<
         let targets = crux_core::targets::find(&[(root.clone(), &h)], &solved);
         let mut images = HashMap::new();
         let mut made = HashMap::new();
-        for u in targets.units.iter().filter(|u| u.lights() > 0) {
-            if let Some(img) = crux_image(&u.path, &cfg.process.workspace).or_else(|| find_image(&u.path)) {
-                images.insert(crux_core::paths::key(&u.path), img);
+        // One picture and status per target folder (`Unit::folder_for`): a
+        // unit holding several targets in folders of their own gets one each.
+        let dirs: BTreeSet<PathBuf> = targets.units.iter().flat_map(|u| u.targets.keys().map(move |t| u.folder_for(t).to_path_buf())).collect();
+        for d in &dirs {
+            if let Some(img) = crux_image(d, &cfg.process.workspace).or_else(|| find_image(d)) {
+                images.insert(crux_core::paths::key(d), img);
             }
-            if let Some(m) = crate::libview::made(&u.path, &cfg.process.workspace) {
-                made.insert(crux_core::paths::key(&u.path), m);
+            if let Some(m) = crate::libview::made(d, &cfg.process.workspace) {
+                made.insert(crux_core::paths::key(d), m);
             }
         }
         let library = crux_core::library::Library::load(&cfg.library).ok().flatten();
@@ -440,6 +452,48 @@ pub fn crux_image(dir: &Path, workspace: &Path) -> Option<PathBuf> {
 pub fn library_parent(root: &Path, cfg: &Config) -> Option<PathBuf> {
     let parent = root.parent().filter(|p| !crux_core::paths::too_broad(p))?;
     cfg.library.search_roots().iter().any(|r| crux_core::library::inside(parent, r)).then(|| parent.to_path_buf())
+}
+
+/// Whether `dir` looks like a folder of targets: at least two of its
+/// subfolders hold an image file (FITS, XISF, CR2) within three levels.
+/// Cheap: stops at each subfolder's first image, looks at no more than 2,000
+/// entries per subfolder and 100 subfolders, never at drive roots or the
+/// home folder, never opens online-only files.
+pub fn looks_like_library_dir(dir: &Path) -> bool {
+    if crux_core::paths::too_broad(dir) {
+        return false;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else { return false };
+    let mut found = 0;
+    for sub in rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).take(100) {
+        let name = sub.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if crux_core::targets::skip_unit(&name) || hidden_or_system(&sub) {
+            continue;
+        }
+        let has = walkdir::WalkDir::new(&sub)
+            .max_depth(3)
+            .into_iter()
+            .take(2_000)
+            .flatten()
+            .any(|e| e.file_type().is_file() && crux_core::meta::format_of(e.path()).is_some() && e.metadata().is_ok_and(|m| !crux_core::paths::cloud_only(&m)));
+        if has {
+            found += 1;
+            if found >= 2 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Where "back to the library" leads from `root`: its library parent, else
+/// the library folder you opened it from (`from`) when `root` is inside it.
+pub fn back_to_library(root: &Path, cfg: &Config, from: Option<&Path>) -> Option<PathBuf> {
+    library_parent(root, cfg).or_else(|| {
+        let f = from?;
+        let inside = crux_core::library::inside(root, f) && crux_core::paths::key(root) != crux_core::paths::key(f);
+        inside.then(|| f.to_path_buf())
+    })
 }
 
 /// Hidden or system folders (Windows attributes; dot names elsewhere are

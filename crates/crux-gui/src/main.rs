@@ -32,10 +32,12 @@ fn state_file() -> Option<PathBuf> {
     crux_core::paths::config_dir().map(|d| d.join("gui.json"))
 }
 
-/// Remember the last folder (in %APPDATA%\crux, never in the data).
-/// Screenshot-harness runs (`CRUX_GUI_SHOT`) don't: they open scratch and
-/// test folders, and would leave James's next start in one of them.
-pub fn remember_folder(dir: &std::path::Path) {
+/// Remember the last folder and the library folder it was opened from (in
+/// %APPDATA%\crux, never in the data), so the way back to the library
+/// works after a restart. Screenshot-harness runs (`CRUX_GUI_SHOT`) don't:
+/// they open scratch and test folders, and would leave James's next start
+/// in one of them.
+pub fn remember_folder(dir: &std::path::Path, library: Option<&std::path::Path>) {
     if std::env::var_os("CRUX_GUI_SHOT").is_some() {
         return;
     }
@@ -43,14 +45,26 @@ pub fn remember_folder(dir: &std::path::Path) {
         if let Some(d) = f.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        let _ = std::fs::write(f, serde_json::json!({ "last_folder": dir }).to_string());
+        let _ = std::fs::write(f, serde_json::json!({ "last_folder": dir, "from_library": library }).to_string());
     }
 }
 
-fn last_folder() -> Option<PathBuf> {
+fn state(key: &str) -> Option<PathBuf> {
     let b = std::fs::read(state_file()?).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&b).ok()?;
-    v.get("last_folder")?.as_str().map(PathBuf::from).filter(|p| p.is_dir())
+    v.get(key)?.as_str().map(PathBuf::from).filter(|p| p.is_dir())
+}
+
+fn last_folder() -> Option<PathBuf> {
+    state("last_folder")
+}
+
+/// The library folder the last folder was opened from.
+pub fn last_library() -> Option<PathBuf> {
+    if std::env::var_os("CRUX_GUI_SHOT").is_some() {
+        return None;
+    }
+    state("from_library")
 }
 
 fn main() -> eframe::Result {

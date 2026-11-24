@@ -48,11 +48,24 @@ pub struct Unit {
     pub bias: usize,
     pub dark_flats: usize,
     pub masters: usize,
+    /// By target: the deepest folder holding all its lights here.
+    #[serde(default)]
+    pub dirs: BTreeMap<String, PathBuf>,
 }
 
 impl Unit {
     pub fn lights(&self) -> usize {
         self.targets.values().sum()
+    }
+    /// The folder that stands for `target` in this unit: the unit itself
+    /// when it holds one target (its pictures and calibration often sit
+    /// beside the lights' folder), else the folder holding that target's
+    /// lights (one contributor's folder with a subfolder per target).
+    pub fn folder_for(&self, target: &str) -> &Path {
+        if self.targets.len() <= 1 {
+            return &self.path;
+        }
+        self.dirs.get(target).map(|d| d.as_path()).unwrap_or(&self.path)
     }
     pub fn calibration(&self) -> usize {
         self.flats + self.darks + self.bias + self.dark_flats
@@ -226,6 +239,18 @@ fn centre(points: &[(f64, f64)]) -> Option<(f64, f64)> {
     Some(((y.atan2(x) / r).rem_euclid(360.0), (z / n).asin() / r))
 }
 
+/// The deepest folder containing both `a` and `b`.
+fn common_dir(a: &Path, b: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for (x, y) in a.components().zip(b.components()) {
+        if x != y {
+            break;
+        }
+        out.push(x);
+    }
+    out
+}
+
 fn sep(a: (f64, f64), b: (f64, f64)) -> f64 {
     crate::astro::separation(a.0, a.1, b.0, b.1)
 }
@@ -288,6 +313,9 @@ pub fn find(scans: &[(PathBuf, &Triage)], solved: &dyn Fn(&Path, u64, i64) -> Op
                     let name = if obj.trim().is_empty() { u.name.clone() } else { normalise(&obj) };
                     let key = name.to_lowercase();
                     *u.targets.entry(name.clone()).or_default() += 1;
+                    let dir = f.meta.path.parent().unwrap_or(&upath).to_path_buf();
+                    let d = u.dirs.entry(name.clone()).or_insert_with(|| dir.clone());
+                    *d = common_dir(d, &dir);
                     let a = acc.entry(key).or_default();
                     *a.names.entry(name).or_default() += 1;
                     if !obj.trim().is_empty() {
@@ -346,11 +374,18 @@ pub fn find(scans: &[(PathBuf, &Triage)], solved: &dyn Fn(&Path, u64, i64) -> Op
     }
     for u in out.units.iter_mut() {
         let mut fixed = BTreeMap::new();
+        let mut dirs: BTreeMap<String, PathBuf> = BTreeMap::new();
+        let mut old_dirs = std::mem::take(&mut u.dirs);
         for (n, c) in std::mem::take(&mut u.targets) {
-            let shown = out.targets.iter().find(|t| t.name.eq_ignore_ascii_case(&n)).map(|t| t.name.clone()).unwrap_or(n);
-            *fixed.entry(shown).or_insert(0) += c;
+            let shown = out.targets.iter().find(|t| t.name.eq_ignore_ascii_case(&n)).map(|t| t.name.clone()).unwrap_or(n.clone());
+            *fixed.entry(shown.clone()).or_insert(0) += c;
+            if let Some(d) = old_dirs.remove(&n) {
+                let e = dirs.entry(shown).or_insert_with(|| d.clone());
+                *e = common_dir(e, &d);
+            }
         }
         u.targets = fixed;
+        u.dirs = dirs;
     }
     // Two names on one field: the same target, or one inside a mosaic.
     for i in 0..object_centres.len() {
@@ -583,6 +618,29 @@ pub fn adopt_caches(plan: &Plan) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn common_dir_is_the_deepest_shared_folder() {
+        let r = PathBuf::from("lib").join("unit");
+        assert_eq!(common_dir(&r.join("a").join("LIGHT"), &r.join("a").join("BAD")), r.join("a"));
+        assert_eq!(common_dir(&r.join("a"), &r.join("b")), r);
+        assert_eq!(common_dir(&r.join("a"), &r.join("a")), r.join("a"));
+    }
+
+    #[test]
+    fn several_targets_in_one_unit_get_their_own_folders() {
+        let u0 = PathBuf::from("lib").join("contributor");
+        let mut u = Unit { path: u0.clone(), ..Default::default() };
+        u.targets.insert("M 42".into(), 10);
+        u.dirs.insert("M 42".into(), u0.join("Orion").join("LIGHT"));
+        // One target: the unit stands for it.
+        assert_eq!(u.folder_for("M 42"), u0.as_path());
+        u.targets.insert("NGC 6164".into(), 5);
+        u.dirs.insert("NGC 6164".into(), u0.join("NGC_6164"));
+        assert_eq!(u.folder_for("M 42"), u0.join("Orion").join("LIGHT").as_path());
+        assert_eq!(u.folder_for("NGC 6164"), u0.join("NGC_6164").as_path());
+        assert_eq!(u.folder_for("unknown"), u0.as_path());
+    }
 
     #[test]
     fn field_names_merge_spellings_not_panels() {

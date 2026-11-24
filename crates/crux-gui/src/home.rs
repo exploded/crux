@@ -332,11 +332,22 @@ fn gallery(ui: &mut egui::Ui, a: &mut UiState, s: Option<&Session>) {
         // Best sub as the picture when there's no finished image.
         let best = (0..s.lights.len()).filter(|&i| s.grade(i) == Grade::Good).max_by(|&x, &y| s.lights[x].t.unwrap_or(0.0).total_cmp(&s.lights[y].t.unwrap_or(0.0)));
         let image = a.target_image.clone().flatten();
+        // Once stacked, the card says what's been made, as on the library's
+        // Home (green once the image is newer than every master); looked up
+        // again every few seconds, so an image made meanwhile shows.
+        let now = ui.input(|i| i.time);
+        if a.target_made.as_ref().is_none_or(|(t, r, _)| now - t > 3.0 || r != &s.root) {
+            a.target_made = Some((now, s.root.clone(), crate::libview::made(&s.root, &s.cfg.process.workspace)));
+        }
+        let status = match a.target_made.as_ref().and_then(|m| m.2) {
+            Some(m) => crate::libview::made_status(&m, &p),
+            None => (Some(if c[2] > 0 { p.warn } else { p.good }), format!("{} frames to review", c[1] + c[2])),
+        };
         targets.push(Target {
             name,
             sub: format!("{panels}{} night{} · {span}", s.nights.len(), if s.nights.len() == 1 { "" } else { "s" }),
             secs,
-            status: (Some(if c[2] > 0 { p.warn } else { p.good }), format!("{} frames to review", c[1] + c[2])),
+            status,
             image,
             thumb: best,
             open: None,
@@ -347,7 +358,7 @@ fn gallery(ui: &mut egui::Ui, a: &mut UiState, s: Option<&Session>) {
     if targets.is_empty() {
         return;
     }
-    let library = s.and_then(|s| crate::worker::library_parent(&s.root, &s.cfg));
+    let library = s.and_then(|s| crate::worker::back_to_library(&s.root, &s.cfg, a.from_library.as_deref()));
     ui.horizontal(|ui| {
         w::h2(ui, "Target");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -568,6 +579,33 @@ fn library_card(ui: &mut egui::Ui, a: &mut UiState, s: Option<&Session>) {
             if let Some(parent) = crate::worker::library_parent(&s.root, &s.cfg) {
                 let n = a.folders.len();
                 row(ui, parent.display().to_string(), if n > 0 { format!("library folder · {n} folders") } else { "library folder · reading…".into() });
+            } else if let Some(lib) = crate::worker::back_to_library(&s.root, &s.cfg, a.from_library.as_deref()) {
+                // Opened from (or inside) a folder of targets that isn't one
+                // of your library folders: calibration frames there aren't
+                // searched until it is.
+                let mut add = false;
+                egui::Frame::new().fill(p.panel2).corner_radius(8).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new("not one of your library folders").font(body(12.0)).color(p.warn));
+                    ui.add(egui::Label::new(RichText::new(lib.display().to_string()).font(mono(12.0))).wrap());
+                    ui.add(
+                        egui::Label::new(RichText::new("Add it, and crux searches it for flats, darks and bias for every target in it.").font(body(12.0)).color(p.muted)).wrap(),
+                    );
+                    ui.add_space(4.0);
+                    add = w::button(ui, &p, "Add to my library folders", Kind::Primary, None).clicked();
+                });
+                if add {
+                    match crate::libview::add_library_folder(&lib) {
+                        Ok(_) => {
+                            // Refresh the calibration library; the folder
+                            // reopens when it's done, with the new setting.
+                            let mut cfg = s.cfg.clone();
+                            cfg.library.search = crux_core::config::Config::load(None, None).map(|c| c.0.library.search).unwrap_or_default();
+                            crate::auto::start_refresh(a, &cfg, ui.ctx());
+                        }
+                        Err(e) => a.toast(ui.ctx(), format!("Couldn't add {}: {e:#}", lib.display()), false),
+                    }
+                }
             }
             let lib = crux_core::library::Library::db_path(&s.cfg.library.dir);
             let sets = s.triage.library.as_ref().map(|l| l.sets.len());
