@@ -1400,35 +1400,46 @@ fn largest_rect(valid: &[bool], w: usize, h: usize) -> Option<(usize, usize, usi
     best.1
 }
 
-/// The linear proxy of the mix before stretching, auto-stretched (one
-/// linked STF), for "before" views: what the channels look like with no
-/// palette work.
+/// The linear proxy of the mix before stretching, auto-stretched per
+/// channel from the image shown: what the channels look like with no
+/// palette work. `gradient_corrected` picks the proxy after gradient
+/// removal instead of before it.
 pub fn linear_view(p: &Prepared, gradient_corrected: bool) -> Rgb {
-    fn pick(c: &Channel, g: bool) -> &Image {
-        if g {
+    linear_rgb(p, gradient_corrected, gradient_corrected)
+}
+
+/// Before and after gradient removal, both stretched from the
+/// uncorrected proxy. One stretch shows the gradient on both sides, and
+/// taking it from the uncorrected side keeps "before" the same whatever
+/// the gradient settings (stretching from the corrected side made it
+/// change with the degree).
+pub fn gradient_pair(p: &Prepared) -> (Rgb, Rgb) {
+    (linear_rgb(p, false, false), linear_rgb(p, true, false))
+}
+
+/// Shows the corrected or uncorrected proxy (`show_corrected`) with each
+/// channel's auto STF taken from its corrected or uncorrected proxy
+/// (`stretch_corrected`).
+fn linear_rgb(p: &Prepared, show_corrected: bool, stretch_corrected: bool) -> Rgb {
+    fn pick(c: &Channel, corrected: bool) -> &Image {
+        if corrected {
             &c.proxy
         } else {
             &c.raw_proxy
         }
     }
-    let pick = |c| pick(c, gradient_corrected);
-    let first = pick(&p.channels[0]);
-    let (w, h) = (first.width, first.height);
-    let names = p.names();
-    let grab = |n: &str| p.channels.iter().position(|c| c.name == n).map(|i| pick(&p.channels[i]));
+    let first = &p.channels[0];
+    let (w, h) = (pick(first, show_corrected).width, pick(first, show_corrected).height);
+    let grab = |n: &str| p.channels.iter().find(|c| c.name == n);
     let (ri, gi, bi) = match p.kind {
         Kind::Broadband => (grab("R"), grab("G"), grab("B")),
         Kind::Narrowband => (grab("S").or(grab("H")), grab("H"), grab("O")),
         Kind::Mono => (Some(first), Some(first), Some(first)),
     };
-    let _ = names;
-    // The stretch comes from the corrected proxy, so before and after
-    // views share it and the gradient shows.
-    let stretch = |img: Option<&Image>| -> Vec<f32> {
-        let Some(img) = img else { return vec![0.0; w * h] };
-        let corrected = p.channels.iter().find(|c| std::ptr::eq(&c.raw_proxy, img) || std::ptr::eq(&c.proxy, img)).map(|c| &c.proxy).unwrap_or(img);
-        let stf = crate::stretch::Stf::auto(corrected);
-        img.data.iter().map(|v| stf.apply(*v)).collect()
+    let stretch = |c: Option<&Channel>| -> Vec<f32> {
+        let Some(c) = c else { return vec![0.0; w * h] };
+        let stf = crate::stretch::Stf::auto(pick(c, stretch_corrected));
+        pick(c, show_corrected).data.iter().map(|v| stf.apply(*v)).collect()
     };
     Rgb { width: w, height: h, r: stretch(ri), g: stretch(gi), b: stretch(bi) }
 }

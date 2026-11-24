@@ -583,7 +583,7 @@ fn tick_views(a: &mut UiState, t: &Target, out: &std::path::Path, tx: &Sender<Ms
                     (v.clone(), v, (String::new(), String::new()))
                 }
                 Stage::Gradient => {
-                    let b = render::linear_view(&p, false);
+                    let (b, corrected) = render::gradient_pair(&p);
                     let a2 = if gmodel {
                         let c = &p.channels[gchan.min(p.channels.len() - 1)];
                         match &c.model {
@@ -596,10 +596,10 @@ fn tick_views(a: &mut UiState, t: &Target, out: &std::path::Path, tx: &Sender<Ms
                                 let v: Vec<f32> = surf.data.iter().map(|x| 0.15 + (x - lo) * k).collect();
                                 render::Rgb { width: w, height: h, r: v.clone(), g: v.clone(), b: v }
                             }
-                            None => render::linear_view(&p, true),
+                            None => corrected,
                         }
                     } else {
-                        render::linear_view(&p, true)
+                        corrected
                     };
                     let right = if gmodel {
                         let c = &p.channels[gchan.min(p.channels.len() - 1)];
