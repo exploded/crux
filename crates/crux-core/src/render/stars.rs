@@ -475,6 +475,9 @@ const GLOW_STARS: usize = 400;
 const GLOW_REACH: f32 = 8.0;
 /// A glow brighter than this share of its star's own light is nebula.
 const GLOW_MAX_RATIO: f32 = 0.02;
+/// A glow over nebula (above the image's dark level) brighter than this
+/// many times the glow's own peak stays in the starless image.
+const GLOW_UNDER_RATIO: f32 = 1.0;
 
 /// Take the round glows the starless image keeps around bright stars out of
 /// it (they go to the star layer instead, with the star's colour). Per star
@@ -497,6 +500,18 @@ struct GlowFit {
     reach: f32,
 }
 
+/// The image's dark level: the 1st percentile of a sample of its data
+/// (registration borders, which are zero, left out).
+fn dark_level(img: &Image) -> f32 {
+    let step = (img.data.len() / 200_000).max(1);
+    let mut v: Vec<f32> = img.data.iter().step_by(step).copied().filter(|v| *v > 0.0).collect();
+    if v.is_empty() {
+        return 0.0;
+    }
+    let k = v.len() / 100;
+    *v.select_nth_unstable_by(k, |a, b| a.total_cmp(b)).1
+}
+
 /// Measure the glows of the brightest stars (see [`remove_glows`]).
 fn glow_fits(sl: &Image, orig: &Image, discs: &[Disc], noise: f32) -> Vec<GlowFit> {
     let (w, h) = (sl.width, sl.height);
@@ -507,6 +522,7 @@ fn glow_fits(sl: &Image, orig: &Image, discs: &[Disc], noise: f32) -> Vec<GlowFi
     let mut bright: Vec<(f32, usize)> = discs.iter().enumerate().map(|(i, d)| (at(orig, d.x, d.y) - at(sl, d.x, d.y), i)).filter(|(c, _)| *c > 50.0 * noise).collect();
     bright.sort_by(|a, b| b.0.total_cmp(&a.0));
     bright.truncate(GLOW_STARS);
+    let sky = dark_level(sl);
     let mut fits = Vec::with_capacity(bright.len());
     for (c, i) in bright {
         let d = &discs[i];
@@ -543,7 +559,7 @@ fn glow_fits(sl: &Image, orig: &Image, discs: &[Disc], noise: f32) -> Vec<GlowFi
         // nebula crossing the star fills the innermost rings.
         let edge = e[(d.r.ceil() as usize).min(n)];
         if std::env::var_os("CRUX_GLOW_DEBUG").is_some() {
-            eprintln!("glow {:.0},{:.0} r {:.1} star {:.5} glow {:.5} ratio {:.3} reach {:.0}", d.x, d.y, d.r, c, edge, edge / c.max(1e-9), reach);
+            eprintln!("glow {:.0},{:.0} r {:.1} star {:.5} glow {:.5} ratio {:.3} reach {:.0} peak {:.5} under {:.5} under/peak {:.2}", d.x, d.y, d.r, c, edge, edge / c.max(1e-9), reach, e[k0], bg - sky, (bg - sky) / e[k0].max(1e-9));
         }
         let mut ex = vec![0f32; n + 1];
         let mut run = e[k0];
@@ -553,7 +569,13 @@ fn glow_fits(sl: &Image, orig: &Image, discs: &[Disc], noise: f32) -> Vec<GlowFi
             }
             ex[k] = run * (1.0 - (k as f32 / reach).min(1.0).powi(2));
         }
-        fits.push(GlowFit { i, nebula: edge > GLOW_MAX_RATIO * c, weak: e[k0] < 2.0 * noise, ex, bg, reach });
+        // Over nebula brighter than the glow, the glow stays too: moved to
+        // the star layer it takes the stars' stretch, which shows it as if
+        // on dark sky, far brighter than the nebula's stretch shows the
+        // nebula around it (M 42: pale discs with ragged edges beside the
+        // Trapezium).
+        let nebula = edge > GLOW_MAX_RATIO * c || bg - sky > GLOW_UNDER_RATIO * e[k0];
+        fits.push(GlowFit { i, nebula, weak: e[k0] < 2.0 * noise, ex, bg, reach });
     }
     fits
 }
@@ -863,6 +885,31 @@ mod tests {
         // … the band crossing it stays, and so does the far sky.
         assert!(sl.get(130, 150) - 0.1 > 0.015, "band lost: {}", sl.get(130, 150));
         assert!((sl.get(10, 10) - 0.1).abs() < 0.002);
+    }
+
+    #[test]
+    fn keeps_the_glow_of_a_star_on_bright_nebula() {
+        // The same faint glow (1.1% of the star at its edge, so not nebula by
+        // that test), but the star sits on nebula 5× brighter than the glow:
+        // moved to the star layer it would show as a pale disc.
+        let (w, h) = (300usize, 300usize);
+        let (cx, cy) = (150.5f32, 150.5f32);
+        let mut sl = Image::new(w, h);
+        let mut orig = Image::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let r2 = (x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2);
+                let nebula = 0.05 * (1.0 - ((r2.sqrt() - 110.0) / 10.0).clamp(0.0, 1.0));
+                let v = 0.1 + nebula + 0.01 * (-r2 / (2.0 * 12.0f32.powi(2))).exp();
+                sl.data[y * w + x] = v;
+                orig.data[y * w + x] = v + 0.8 * (-r2 / (2.0 * 2.0f32.powi(2))).exp();
+            }
+        }
+        let before = sl.data.clone();
+        let disc = Disc { x: cx, y: cy, r: 6.0, peaked: 3.0 };
+        assert_eq!(glow_nebula(&sl, &orig, &[disc.clone()], 0.0006), vec![true]);
+        remove_glows(&mut sl, &orig, &[disc], 0.0006, &[false]);
+        assert_eq!(sl.data, before);
     }
 
     #[test]

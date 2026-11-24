@@ -722,12 +722,22 @@ pub fn coefficients_starless(p: &Prepared, r: &Recipe) -> Option<palette::Coef> 
 /// the starless image's small residuals don't speckle the stars' stretch.
 pub const STAR_FLOOR_SIGMAS: f32 = stars::STAR_FLOOR_SIGMAS as f32;
 
+/// The star layer's floor also rises by this share of the starless level
+/// above the channel's dark level. Over bright nebula the star remover's
+/// small errors (a 2 px checkerboard of up to ~1% of the level in M 42's
+/// core) are far above the sky's noise, and the stars' stretch, which shows
+/// light as if on dark sky, turned them into a grid over the core.
+const STAR_FLOOR_SHARE: f32 = 0.02;
+
 /// What the separate stretch needs for one render.
 pub struct Split {
     pub coef: palette::Coef,
     pub curve: stars::Curve,
     /// Per channel: the star layer's floor at this render's resolution.
     pub floor: Vec<f32>,
+    /// Per channel: the starless image's dark level (1st percentile), from
+    /// which [`STAR_FLOOR_SHARE`] counts.
+    pub dark: Vec<f32>,
     /// Nebula detail for this render, when asked for.
     pub detail: Option<Detail>,
     /// Colour noise reduction for this render, when asked for.
@@ -1086,7 +1096,8 @@ fn split_of(p: &Prepared, r: &Recipe, planes: &[&[f32]], bare: &[&[f32]], frame:
             own + (cut - STAR_FLOOR_SIGMAS).max(0.0) * noise
         })
         .collect();
-    Some(Split { coef, curve, floor, detail, chroma, neutral })
+    let dark = p.channels.iter().map(|c| c.stats_starless.as_ref().map_or(0.0, |s| palette::quantile_of_sorted(&s.sorted, 0.01) as f32)).collect();
+    Some(Split { coef, curve, floor, dark, detail, chroma, neutral })
 }
 
 /// Star colour constants.
@@ -1161,7 +1172,12 @@ fn render_planes(planes: &[&[f32]], bare: Option<&[&[f32]]>, w: usize, h: usize,
                 for i in 0..len {
                     let light = |k: usize| {
                         let v = ch[k][i];
-                        if v <= palette::ZERO_FLOOR { 0.0 } else { (v - bc[k][i] - sp.floor[k]).max(0.0) }
+                        if v <= palette::ZERO_FLOOR {
+                            0.0
+                        } else {
+                            let b = bc[k][i];
+                            (v - b - sp.floor[k] - STAR_FLOOR_SHARE * (b - sp.dark[k]).max(0.0)).max(0.0)
+                        }
                     };
                     let star = |k: usize| pt.flux[k][s + i];
                     let o = stars::screen([rr[i], gg[i], bb[i]], &light, &star, pt.confidence[s + i], [fr[i], fg[i], fb[i]], c, &sp.curve);
