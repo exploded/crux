@@ -13,8 +13,7 @@ changing your raw data.
   <em>M 17 from 4.7 hours of H-alpha, OIII and SII subs, processed entirely by crux.</em>
 </p>
 
-**Status:** in development. Used daily on Windows, and tested on Linux
-(Debian) and macOS (an iMac).
+Used daily on Windows, and tested on Linux (Debian) and macOS (an iMac).
 
 ## What it does
 
