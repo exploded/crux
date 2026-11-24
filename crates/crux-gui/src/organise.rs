@@ -1124,6 +1124,7 @@ fn health(ui: &mut egui::Ui, a: &mut UiState, s: &mut Session) {
         w::card(ui, &p, |ui| w::muted(ui, &p, "Measuring the library…"));
         return;
     }
+    let area = a.health_area.clone().unwrap_or_else(|| parent.clone());
     let total: u64 = a.spaces.iter().map(|x| x.total()).sum();
     let reb: u64 = a.spaces.iter().map(|x| x.get(Part::Rebuildable)).sum();
     let mut reclaim = false;
@@ -1133,7 +1134,7 @@ fn health(ui: &mut egui::Ui, a: &mut UiState, s: &mut Session) {
                 w::h2(ui, "Where the space goes");
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
-                    ui.label(RichText::new(format!("{} · {} measured ·", parent.display(), gb(total))).font(body(13.0)).color(p.muted));
+                    ui.label(RichText::new(format!("{} · {} measured ·", area.display(), gb(total))).font(body(13.0)).color(p.muted));
                     ui.label(RichText::new(gb(reb)).font(semibold(13.0)).color(p.warn));
                     ui.label(RichText::new("is WBPP intermediates that can be rebuilt from raw subs").font(body(13.0)).color(p.muted));
                 });

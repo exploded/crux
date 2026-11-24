@@ -125,6 +125,8 @@ pub struct UiState {
     /// The library index (every folder), each folder's space, empty folders.
     pub library: Vec<crux_core::index::IndexFile>,
     pub spaces: Vec<crux_core::health::FolderSpace>,
+    /// The folder `spaces` covers.
+    pub health_area: Option<PathBuf>,
     pub empty_dirs: Vec<PathBuf>,
     pub index_error: Option<String>,
     pub org: crate::organise::OrgUi,
@@ -273,6 +275,7 @@ impl App {
                 bg: crate::auto::Bg::new(bg_tx, args.cache_dir.as_ref().map(|d| d.join("autopilot"))),
                 library: Vec::new(),
                 spaces: Vec::new(),
+                health_area: None,
                 empty_dirs: Vec::new(),
                 index_error: None,
                 org: crate::organise::OrgUi::default(),
@@ -362,6 +365,7 @@ impl App {
         self.ui.org.dups = None;
         self.ui.org.dup_progress = None;
         self.ui.spaces.clear();
+        self.ui.health_area = None;
         // The old folder's neighbours, until the new folder's arrive.
         self.ui.folders.clear();
         self.ui.target_image = None;
@@ -433,9 +437,10 @@ impl App {
                     let tex = ctx.load_texture(format!("gallery{}", p.display()), img, egui::TextureOptions::LINEAR);
                     self.ui.gallery.insert(p, tex);
                 }
-                Msg::Library { files, spaces, empty, error } => {
+                Msg::Library { files, spaces, empty, area, error } => {
                     self.ui.library = files;
                     self.ui.spaces = spaces;
+                    self.ui.health_area = Some(area);
                     self.ui.empty_dirs = empty;
                     self.ui.index_error = error;
                 }
@@ -803,6 +808,7 @@ impl App {
                 None => false,
             } || ctx.input(|i| i.time) > 60.0)
             && (self.ui.view != View::Calibrate || self.ui.cal.fp.is_some() || ctx.input(|i| i.time) > 120.0)
+            && (self.ui.view != View::Organise || self.ui.org.tab != crate::organise::Tab::Health || self.ui.health_area.is_some() || ctx.input(|i| i.time) > 120.0)
             && (self.ui.view != View::Image || self.ui.stack.ready_for_shot() || ctx.input(|i| i.time) > 180.0);
         if ready {
             sh.frames_ready += 1;

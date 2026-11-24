@@ -52,7 +52,9 @@ pub enum Msg {
     TargetImage(Option<PathBuf>),
     Gallery(PathBuf, egui::ColorImage),
     /// The library index (every folder) and each folder's space.
-    Library { files: Vec<IndexFile>, spaces: Vec<FolderSpace>, empty: Vec<PathBuf>, error: Option<String> },
+    /// `area`: the folder Library health measured (the library folder
+    /// holding the open folder, else the open folder itself).
+    Library { files: Vec<IndexFile>, spaces: Vec<FolderSpace>, empty: Vec<PathBuf>, area: PathBuf, error: Option<String> },
     /// A move plan being applied or undone.
     MoveProgress { done: usize, total: usize, file: PathBuf },
     MoveDone { undo: bool, result: Result<crux_core::moves::Outcome, String>, root: PathBuf },
@@ -309,8 +311,14 @@ fn open(job: &OpenJob, tx: &Sender<Msg>, ctx: &egui::Context) -> anyhow::Result<
             (v, None)
         }
     };
-    let empty = parent.as_deref().map(crux_core::health::empty_dirs).unwrap_or_default();
-    let _ = tx.send(Msg::Library { files, spaces, empty, error });
+    // Outside your library folders (or beside a drive root) only the open
+    // folder is measured; without this Library health waited forever.
+    let area = parent.clone().unwrap_or_else(|| root.clone());
+    if spaces.is_empty() {
+        spaces.push(crux_core::health::space(root, &own_frames));
+    }
+    let empty = crux_core::health::empty_dirs(&area);
+    let _ = tx.send(Msg::Library { files, spaces, empty, area, error });
     ctx.request_repaint();
     // Darks, bias and dark flats across the library, by fingerprint: the
     // folders beside this one, plus those the calibration library knows.
