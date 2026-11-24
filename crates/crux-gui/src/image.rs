@@ -464,14 +464,42 @@ pub fn load(a: &mut UiState, s: &Session) {
 /// Keep prepared channels and the preview up to date (after [`load`]).
 /// Called every frame while an image stage is shown.
 pub fn tick(a: &mut UiState, s: &Session, tx: &Sender<Msg>, ctx: &egui::Context) {
-    load(a, s);
+    ensure_prepared(a, s, tx, ctx);
     let Some(plan) = &a.stack.plan else { return };
     let out = plan.out.clone();
     let st = a.stack.stage;
     let img = &mut a.stack.img;
     let Some(t) = img.target().cloned() else { return };
+    if img.recipe.is_none() {
+        return;
+    }
+    // Harness: switch enhance steps on.
+    for step in std::mem::take(&mut img.pending_enhance) {
+        let Some(rr) = img.recipe.as_mut() else { break };
+        match step {
+            "denoise" => rr.enhance.denoise = true,
+            "correct" => rr.enhance.sharpen = render::enhance::Sharpen::Correct,
+            "tighten" => rr.enhance.sharpen = render::enhance::Sharpen::Tighten,
+            _ => {}
+        }
+    }
+    if st == Stage::Enhance {
+        enhance_tick(img, &t, &out, tx, ctx);
+    }
+    tick_views(a, &t, &out, tx, ctx);
+}
+
+/// Start preparing the selected target's masters (sharpen and denoise,
+/// star remover, gradient) in the background when its settings changed.
+/// Called by [`tick`] on the image steps, and by the Stack page once
+/// stacking is done, so the wait overlaps with reading the results.
+pub fn ensure_prepared(a: &mut UiState, s: &Session, tx: &Sender<Msg>, ctx: &egui::Context) {
+    load(a, s);
+    let Some(plan) = &a.stack.plan else { return };
+    let out = plan.out.clone();
+    let img = &mut a.stack.img;
+    let Some(t) = img.target().cloned() else { return };
     let Some(r) = img.recipe.clone() else { return };
-    // Read and correct the masters in the background.
     let want = want_key(&t, &r);
     if want != img.prep_key && img.preparing.is_none() {
         img.preparing = Some(want.clone());
@@ -495,19 +523,13 @@ pub fn tick(a: &mut UiState, s: &Session, tx: &Sender<Msg>, ctx: &egui::Context)
             })
             .expect("spawn image");
     }
-    // Harness: switch enhance steps on.
-    for step in std::mem::take(&mut img.pending_enhance) {
-        let rr = img.recipe.as_mut().unwrap();
-        match step {
-            "denoise" => rr.enhance.denoise = true,
-            "correct" => rr.enhance.sharpen = render::enhance::Sharpen::Correct,
-            "tighten" => rr.enhance.sharpen = render::enhance::Sharpen::Tighten,
-            _ => {}
-        }
-    }
-    if st == Stage::Enhance {
-        enhance_tick(img, &t, &out, tx, ctx);
-    }
+}
+
+/// The image steps' previews, preset tiles and pending harness actions
+/// (after [`ensure_prepared`]).
+fn tick_views(a: &mut UiState, t: &Target, out: &std::path::Path, tx: &Sender<Msg>, ctx: &egui::Context) {
+    let st = a.stack.stage;
+    let img = &mut a.stack.img;
     // Background renders that have landed become textures.
     if let Some(v) = img.view_pending.take() {
         let (key, before, after, labels, ms) = *v;
@@ -649,7 +671,7 @@ pub fn tick(a: &mut UiState, s: &Session, tx: &Sender<Msg>, ctx: &egui::Context)
     }
     if img.pending_write && !img.writing {
         img.pending_write = false;
-        start_write(img, &t, &out, tx, ctx);
+        start_write(img, t, out, tx, ctx);
     }
 }
 
@@ -774,7 +796,14 @@ pub fn header(ui: &mut Ui, a: &mut UiState, p: &Pal, tx: &Sender<Msg>) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let img = &mut a.stack.img;
             let ok = img.prepared.is_some() && !img.writing;
-            if w::button_enabled(ui, p, if img.writing { "Creating…" } else { "Create full-size image" }, Kind::Primary, None, ok).clicked() {
+            let label = if img.writing {
+                "Creating…"
+            } else if img.prepared.is_none() && img.preparing.is_some() {
+                "Preparing…"
+            } else {
+                "Create full-size image"
+            };
+            if w::button_enabled(ui, p, label, Kind::Primary, None, ok).clicked() {
                 if let (Some(t), Some(o)) = (img.target().cloned(), out.clone()) {
                     start_write(img, &t, &o, tx, ui.ctx());
                 }
@@ -794,6 +823,26 @@ pub fn header(ui: &mut Ui, a: &mut UiState, p: &Pal, tx: &Sender<Msg>) {
         }
         Some(Err(e)) => {
             ui.label(RichText::new(format!("Couldn't create the image: {e}")).color(p.rej));
+        }
+        None if img.writing || img.targets.is_empty() => {}
+        None if img.preparing.is_some() => {
+            // The first preparation runs the networks: say what's happening
+            // and why the button waits.
+            ui.add_space(6.0);
+            let what = img.progress.clone().unwrap_or_else(|| "reading the masters".into());
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::Spinner::new().size(12.0).color(p.accent));
+                let t = if img.prepared.is_some() {
+                    format!("Updating the masters for the new settings: {what}.")
+                } else {
+                    format!("Preparing the masters: {what}. Create full-size image is ready when this finishes. crux keeps the results, so it's quicker next time.")
+                };
+                ui.label(RichText::new(t).color(p.muted));
+            });
+        }
+        None if img.prepared.is_some() => {
+            ui.add_space(6.0);
+            w::muted(ui, p, "Adjust the image steps if you like, then press Create full-size image.");
         }
         None => {}
     }

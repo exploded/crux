@@ -124,6 +124,9 @@ pub struct StackUi {
     pub mos: crate::mosaic::MosaicUi,
     /// A run just finished: assemble the mosaic if Process includes it.
     pub mosaic_next: bool,
+    /// A run just finished cleanly: open the first image step once the
+    /// stacking steps (and any mosaic after them) are done.
+    pub open_image_next: bool,
     /// What Process would do now (lights and masters out of date).
     pub pending: Option<job::Pending>,
 }
@@ -158,6 +161,7 @@ impl Default for StackUi {
             img: Default::default(),
             mos: Default::default(),
             mosaic_next: false,
+            open_image_next: false,
             pending: None,
         }
     }
@@ -172,6 +176,11 @@ impl StackUi {
     }
 
     pub fn ready_for_shot(&self) -> bool {
+        // A run (and the mosaic after it) ends first: `stack-run` shoots
+        // what it leads to.
+        if self.running.is_some() || self.mosaic_next || self.open_image_next {
+            return false;
+        }
         if self.stage == Stage::Mosaic {
             return self.mos.ready_for_shot() || self.plan_error.is_some();
         }
@@ -227,6 +236,7 @@ impl StackUi {
             Msg::ProcessDone(r) => {
                 self.running = None;
                 self.mosaic_next = matches!(&r, Ok(rep) if !rep.cancelled && rep.integration_failed == 0);
+                self.open_image_next = matches!(&r, Ok(rep) if !rep.cancelled && rep.integration_failed == 0 && rep.failed == 0);
                 self.pending = self.plan.as_ref().map(job::pending);
                 self.report = Some(r);
                 if self.stage == Stage::Integrate {
@@ -439,7 +449,7 @@ fn want_integrate_preview(a: &mut UiState, tx: &Sender<Msg>, ctx: &egui::Context
         .name("crux-preview".into())
         .spawn(move || {
             let r = (|| -> anyhow::Result<PreviewImgs> {
-                anyhow::ensure!(st.out.is_file(), "not integrated yet: press Process");
+                anyhow::ensure!(st.out.is_file(), "not integrated yet: run the stacking steps");
                 let master = crux_core::read_image(&st.out)?;
                 let n = report.as_ref().map(|r| r.frames.len()).unwrap_or(st.lights.len());
                 let mut info = Vec::new();
@@ -663,11 +673,17 @@ pub fn view(ui: &mut Ui, a: &mut UiState, s: &mut Session, tx: &Sender<Msg>) {
     // The mosaic stage's state also feeds the stage list and the image
     // targets, so it ticks on every stage.
     crate::mosaic::tick(a, s, tx, ui.ctx());
+    // Targets first, so a run that just made masters can open the image.
+    crate::image::load(a, s);
+    open_image_after_run(a, s, ui.ctx());
     if a.stack.stage.is_image() {
         crate::image::tick(a, s, tx, ui.ctx());
     } else {
-        // The step list's image steps need the targets and recipe.
-        crate::image::load(a, s);
+        // Once stacking is done, prepare the image in the background so
+        // the image steps are ready when the user opens them.
+        if stacking_done(a) {
+            crate::image::ensure_prepared(a, s, tx, ui.ctx());
+        }
         if a.stack.stage != Stage::Mosaic {
             want_preview(a, s, tx, ui.ctx());
         }
@@ -739,6 +755,34 @@ fn pinned_image(ui: &mut Ui, a: &mut UiState, s: &mut Session, p: &Pal, tx: &Sen
     ru.set_width(rw);
     crate::image::main_pinned(&mut ru, a, s, p, tx);
     ui.advance_cursor_after_rect(Rect::from_min_size(top, Vec2::new(full, h)));
+}
+
+/// Nothing of the stacking steps is running or waiting to run (a mosaic
+/// assembled after integrating included).
+fn stacking_idle(a: &UiState) -> bool {
+    a.stack.running.is_none() && a.stack.mos.running.is_none() && !a.stack.mos.pending_run && !a.stack.mosaic_next
+}
+
+/// The stacking steps are done and up to date and masters exist, so the
+/// image steps are what comes next.
+pub fn stacking_done(a: &UiState) -> bool {
+    let n = a.stack.plan.as_ref().map_or(0, |pl| pl.n_lights());
+    n > 0 && matches!(a.stack.pending, Some(pd) if pd.is_empty()) && stacking_idle(a) && !a.stack.img.targets.is_empty()
+}
+
+/// After a clean run, once the stacking steps (and a mosaic after them)
+/// have finished: open the first image step, unless the user went to a
+/// step outside the run meanwhile or the mosaic failed.
+fn open_image_after_run(a: &mut UiState, s: &Session, ctx: &egui::Context) {
+    if !a.stack.open_image_next || !stacking_idle(a) {
+        return;
+    }
+    a.stack.open_image_next = false;
+    let on_run_step = process_steps(a, s).contains(&a.stack.stage);
+    if stacking_done(a) && on_run_step && a.stack.mos.error.is_none() {
+        a.stack.stage = Stage::Enhance;
+        a.toast(ctx, "Stacking done. Check the image steps, then press Create full-size image.", false);
+    }
 }
 
 /// The stages Process runs, in order.
@@ -842,7 +886,12 @@ fn header(ui: &mut Ui, a: &mut UiState, s: &Session, p: &Pal) {
             );
             let n = a.stack.plan.as_ref().map_or(0, |pl| pl.n_lights());
             match a.stack.pending {
-                Some(pd) if pd.is_empty() && n > 0 => t.push_str(" Every light is processed and unchanged. Changing a setting, a grade or a master marks the lights it affects for processing again."),
+                Some(pd) if pd.is_empty() && n > 0 => {
+                    t.push_str(" Every light is processed and unchanged. Changing a setting, a grade or a master marks the lights it affects for processing again.");
+                    if stacking_done(a) {
+                        t.push_str(" Next, make the picture: click Next: make the image, or any of the image steps.");
+                    }
+                }
                 Some(pd) if pd.lights < n => t.push_str(&format!(" {} of {n} lights are already processed and unchanged, so the run skips them.", n - pd.lights)),
                 _ => {}
             }
@@ -1094,6 +1143,11 @@ fn stages(ui: &mut Ui, a: &mut UiState, s: &Session, p: &Pal, tx: &Sender<Msg>) 
                 _ => {}
             }
         }
+        // The first image step, while no image has been made: mark it.
+        let img = &a.stack.img;
+        if st == Stage::Enhance && !a.stack.stage.is_image() && stacking_done(a) && !matches!(img.written, Some(Ok(_))) {
+            sum.push_str("\nStart here to make the image");
+        }
         if stage_button(ui, p, &name, &sum, dot, a.stack.stage == st, true).clicked() {
             a.stack.stage = st;
         }
@@ -1140,6 +1194,12 @@ fn run_button(ui: &mut Ui, a: &mut UiState, p: &Pal, steps: &[Stage], tx: &Sende
         });
         if w::button(ui, p, "Cancel", Kind::Danger, None).clicked() {
             a.stack.mos.cancel.store(true, Ordering::Relaxed);
+        }
+    } else if stacking_done(a) {
+        // Nothing left to stack: point to what comes next.
+        ui.label(RichText::new(format!("Steps 1–{k} are up to date")).font(body(12.0)).color(p.muted));
+        if w::button(ui, p, "Next: make the image", Kind::Primary, None).clicked() {
+            a.stack.stage = Stage::Enhance;
         }
     } else if let Some(n) = a.stack.plan.as_ref().map(|pl| pl.n_lights()) {
         let (label, enabled) = process_label(n, k, a.stack.pending);
