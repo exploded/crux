@@ -16,6 +16,7 @@
 #[cfg(feature = "ml")]
 pub mod net;
 pub mod enhance;
+pub mod fill;
 pub mod gradient;
 pub mod palette;
 pub mod prepcache;
@@ -336,6 +337,38 @@ pub fn step_word(s: &str) -> String {
     }
 }
 
+/// Fill channels framed differently from the others from their stand-ins
+/// (`fill`), masters and starless masters with one fit. Returns the names
+/// of the channels filled. A starless master is filled only when every
+/// stand-in has one; otherwise it's dropped, so the classic fill makes a
+/// starless copy from the filled master instead.
+fn fill_coverage(read: &mut [(&Master, Image, Option<Image>)], names: &[String]) -> Vec<String> {
+    let plans = {
+        let imgs: Vec<&Image> = read.iter().map(|r| &r.1).collect();
+        fill::plan(&imgs, names)
+    };
+    let mut out = Vec::new();
+    let mut done: Vec<(usize, Image, Option<Image>)> = Vec::new();
+    for (k, f) in plans.iter().enumerate() {
+        let Some(f) = f else { continue };
+        let donors: Vec<&Image> = f.donors.iter().map(|&d| &read[d].1).collect();
+        let img = fill::apply(f, &read[k].1, &donors);
+        let sl_donors: Option<Vec<&Image>> = f.donors.iter().map(|&d| read[d].2.as_ref()).collect();
+        let sl = read[k].2.as_ref().zip(sl_donors).map(|(s, d)| fill::apply(f, s, &d));
+        if std::env::var_os("CRUX_TIMING").is_some() {
+            let from: Vec<&str> = f.donors.iter().map(|&d| names[d].as_str()).collect();
+            eprintln!("fill {} from {}: a {:.4} b {:.6}", names[k], from.join("+"), f.a, f.b);
+        }
+        out.push(names[k].clone());
+        done.push((k, img, sl));
+    }
+    for (k, img, sl) in done {
+        read[k].1 = img;
+        read[k].2 = sl;
+    }
+    out
+}
+
 /// Read and correct a target's masters. `keep_full` keeps the
 /// full-resolution channels for a final render.
 pub fn prepare(t: &Target, g: &GradientSettings, st: &stars::StarSettings, keep_full: bool, cancel: &AtomicBool) -> Result<Prepared> {
@@ -357,6 +390,7 @@ pub fn prepare(t: &Target, g: &GradientSettings, st: &stars::StarSettings, keep_
     // grid.
     let names0: Vec<String> = t.masters.iter().map(|m| m.channel.clone()).collect();
     let follow = g.enabled && g.follow_sky && palette::kind_of(&names0) == Kind::Broadband && st.engine == stars::StarEngine::Network && t.masters.iter().all(|m| m.starless.is_some());
+    let mut read = Vec::new();
     for m in &t.masters {
         if cancel.load(Ordering::Relaxed) {
             anyhow::bail!("cancelled");
@@ -366,33 +400,47 @@ pub fn prepare(t: &Target, g: &GradientSettings, st: &stars::StarSettings, keep_
             None => size = Some((img.width, img.height)),
             Some(s) => anyhow::ensure!(s == (img.width, img.height), "{} is {}×{}, the other masters {}×{}: they must be registered to one reference", m.path.display(), img.width, img.height, s.0, s.1),
         }
+        // The star remover's starless master when chosen (made by `starnet`).
+        let net_sl = (st.engine == stars::StarEngine::Network)
+            .then(|| m.starless.as_ref().and_then(|p| crate::read_image(p).ok()))
+            .flatten()
+            .filter(|s| (s.width, s.height) == (img.width, img.height));
+        read.push((m, img, net_sl));
+    }
+    lap("read");
+    // Channels framed differently from the others: their empty parts
+    // filled from stand-in channels (`fill`), starless masters likewise.
+    let filled = fill_coverage(&mut read, &names0);
+    if !filled.is_empty() {
+        lap("coverage filled");
+    }
+    for (m, img, net_sl) in read {
         let smp = if follow {
-            let sl = m.starless.as_ref().and_then(|p| crate::read_image(p).ok()).filter(|s| (s.width, s.height) == (img.width, img.height));
-            Some(gradient::samples(sl.as_ref().unwrap_or(&img), 2 * g.samples))
+            Some(gradient::samples(net_sl.as_ref().unwrap_or(&img), 2 * g.samples))
         } else {
             g.enabled.then(|| gradient::samples(&img, g.samples))
         };
-        fulls.push((m, img, smp));
+        fulls.push((m, img, smp, net_sl));
     }
-    lap("read and sampled");
+    lap("sampled");
     // One degree for every channel.
     let degree = if g.degree > 0 {
         g.degree
     } else {
-        let mut d: Vec<u32> = fulls.iter().filter_map(|(_, _, s)| s.as_ref().map(|s| gradient::auto_degree(s, g.tolerance))).collect();
+        let mut d: Vec<u32> = fulls.iter().filter_map(|(_, _, s, _)| s.as_ref().map(|s| gradient::auto_degree(s, g.tolerance))).collect();
         d.sort();
         d.get(d.len().saturating_sub(1) / 2).copied().unwrap_or(1)
     };
     let (width, height) = size.unwrap_or((0, 0));
     let gfit = &GradientSettings { follow_sky: follow, ..g.clone() };
     let mut corrected = Vec::new();
-    for (m, mut img, smp) in fulls {
+    for (m, mut img, smp, net_sl) in fulls {
         let raw_proxy = proxy(&img, PROXY_MAX);
         let fit = smp.and_then(|s| gradient::fit_samples(&s, gfit, degree));
         if let Some((md, _)) = &fit {
             md.apply(&mut img);
         }
-        corrected.push((m, img, raw_proxy, fit));
+        corrected.push((m, img, raw_proxy, fit, net_sl));
     }
     lap("gradient fitted");
     let names: Vec<String> = corrected.iter().map(|c| c.0.channel.clone()).collect();
@@ -437,7 +485,7 @@ pub fn prepare(t: &Target, g: &GradientSettings, st: &stars::StarSettings, keep_
         corrected
             .into_par_iter()
             .enumerate()
-            .map(|(k, (m, img, raw_proxy, fit))| {
+            .map(|(k, (m, img, raw_proxy, fit, net_sl))| {
                 let (model, report) = match fit {
                     Some((md, rp)) => (Some(md), Some(rp)),
                     None => (None, None),
@@ -451,13 +499,9 @@ pub fn prepare(t: &Target, g: &GradientSettings, st: &stars::StarSettings, keep_
                 let noise_full = crate::process::combine::noise_of(&img);
                 let noise_proxy = crate::process::combine::noise_of(&px);
                 laps.lap("noise");
-                // The star remover's starless master when chosen (made by
-                // `starnet`), corrected like the master; else the classic fill.
-                let net_sl = (st.engine == stars::StarEngine::Network)
-                    .then(|| m.starless.as_ref().and_then(|p| crate::read_image(p).ok()))
-                    .flatten()
-                    .filter(|s| (s.width, s.height) == (img.width, img.height))
-                    .map(|mut s| {
+                // The star remover's starless master, corrected like the
+                // master; else the classic fill.
+                let net_sl = net_sl.map(|mut s| {
                         if let Some(md) = &model {
                             md.apply(&mut s);
                         }
@@ -493,7 +537,9 @@ pub fn prepare(t: &Target, g: &GradientSettings, st: &stars::StarSettings, keep_
                 laps.lap("starless stats");
                 let crop = cut(&img);
                 let crop_starless = sl.as_ref().map(&cut);
-                let thin = thin_edges(&img);
+                // A filled channel's fill is the stand-in's noise scaled:
+                // not a thin edge. Its stand-ins judge those parts.
+                let thin = if filled.contains(&m.channel) { None } else { thin_edges(&img) };
                 laps.lap("thin edges");
                 (m, img, raw_proxy, model, report, px, stats, noise_full, noise_proxy, sl, sl_proxy, stats_starless, crop, crop_starless, thin)
             })
