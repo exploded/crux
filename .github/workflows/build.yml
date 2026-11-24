@@ -62,7 +62,10 @@ jobs:
           - name: linux-x86_64
             # The oldest supported Ubuntu, so the binaries run on older glibc.
             os: ubuntu-22.04
-          - name: macos-arm64
+          # One file for Apple Silicon and Intel Macs ("Bad CPU type in
+          # executable" on Intel with an arm64-only build). The Intel half
+          # is cross-compiled on the Apple Silicon runner.
+          - name: macos-universal
             os: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -70,11 +73,25 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libwayland-dev libxkbcommon-dev libx11-dev
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ startsWith(github.ref, 'refs/tags/') }}
       # The dist profile is the release profile without debug info.
-      - run: cargo build -p crux-gui --profile dist --locked
+      - name: Build
+        if: runner.os != 'macOS'
+        run: cargo build -p crux-gui --profile dist --locked
+      - name: Build (universal)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build -p crux-gui --profile dist --locked --target aarch64-apple-darwin
+          cargo build -p crux-gui --profile dist --locked --target x86_64-apple-darwin
+          mkdir -p target/dist
+          lipo -create -output target/dist/crux-gui \
+            target/aarch64-apple-darwin/dist/crux-gui \
+            target/x86_64-apple-darwin/dist/crux-gui
+          lipo -info target/dist/crux-gui
       - name: Package
         shell: bash
         run: |

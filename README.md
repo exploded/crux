@@ -9,7 +9,8 @@ Windows, Linux and macOS.
 
 ## Download
 
-Builds for Windows (x86-64), Linux (x86-64) and macOS (Apple Silicon) are on
+Builds for Windows (x86-64), Linux (x86-64) and macOS (Apple Silicon and
+Intel, in one file) are on
 the [Releases](https://github.com/exploded/crux/releases) page. There's
 nothing to install: unpack the archive and run `crux-gui`.
 
