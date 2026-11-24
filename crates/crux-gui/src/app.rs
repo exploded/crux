@@ -744,11 +744,12 @@ impl App {
                     "stack-map:low" => self.ui.stack.imap = 1,
                     "stack-map:high" => self.ui.stack.imap = 2,
                     // Image stages: img-preset:<name>, img-target:<n>, img-view:<f>, img-fold, img-model,
-                    // img-chan:<n>, img-expert, img-auto, img-write.
+                    // img-chan:<n>, img-expert, img-auto, img-write, img-run (the step list's button).
                     "img-model" => self.ui.stack.img.gmodel = true,
                     "img-expert" => self.ui.stack.img.depth = crate::image::Depth::Expert,
                     "img-auto" => self.ui.stack.img.depth = crate::image::Depth::Auto,
                     "img-write" => self.ui.stack.img.pending_write = true,
+                    "img-run" => self.ui.stack.img.pending_run = true,
                     "img-whole" => self.ui.stack.img.sview = 0,
                     "img-starless" => self.ui.stack.img.sview = 2,
                     // Sharpen and denoise stage: turn steps on, show the corner.

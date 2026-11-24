@@ -889,7 +889,7 @@ fn header(ui: &mut Ui, a: &mut UiState, s: &Session, p: &Pal) {
                 Some(pd) if pd.is_empty() && n > 0 => {
                     t.push_str(" Every light is processed and unchanged. Changing a setting, a grade or a master marks the lights it affects for processing again.");
                     if stacking_done(a) {
-                        t.push_str(" Next, make the picture: click Next: make the image, or any of the image steps.");
+                        t.push_str(&format!(" Next, make the picture: run steps {}–{} under the image steps, or open any of them to adjust it first.", k + 1, k + IMAGE_STEPS.len()));
                     }
                 }
                 Some(pd) if pd.lights < n => t.push_str(&format!(" {} of {n} lights are already processed and unchanged, so the run skips them.", n - pd.lights)),
@@ -1128,8 +1128,11 @@ fn short_name(n: &str) -> String {
 fn stages(ui: &mut Ui, a: &mut UiState, s: &Session, p: &Pal, tx: &Sender<Msg>) {
     ui.spacing_mut().item_spacing.y = 6.0;
     let steps = process_steps(a, s);
+    let k = steps.len();
     let card = |ui: &mut Ui, a: &mut UiState, st: Stage| {
-        let name = match steps.iter().position(|&x| x == st) {
+        // Image steps carry on from the stacking steps' numbers.
+        let n = steps.iter().position(|&x| x == st).or_else(|| IMAGE_STEPS.iter().position(|&x| x == st).map(|i| k + i));
+        let name = match n {
             Some(i) => format!("{}. {}", i + 1, stage_name(st)),
             None => stage_name(st).to_string(),
         };
@@ -1169,10 +1172,15 @@ fn stages(ui: &mut Ui, a: &mut UiState, s: &Session, p: &Pal, tx: &Sender<Msg>) 
     }
     ui.add_space(8.0);
     w::eyebrow(ui, p, "Image steps");
-    for st in [Stage::Enhance, Stage::Gradient, Stage::Palette, Stage::Finish, Stage::Stars, Stage::Crop] {
+    for st in IMAGE_STEPS {
         card(ui, a, st);
     }
+    let ready = stacking_done(a);
+    crate::image::run_button(ui, a, p, k + 1, k + IMAGE_STEPS.len(), ready, tx);
 }
+
+/// The image steps in the order the full-size image applies them.
+const IMAGE_STEPS: [Stage; 6] = [Stage::Enhance, Stage::Gradient, Stage::Palette, Stage::Finish, Stage::Stars, Stage::Crop];
 
 /// The run button under the stacking steps, or Cancel and progress while
 /// they run.
@@ -1196,11 +1204,9 @@ fn run_button(ui: &mut Ui, a: &mut UiState, p: &Pal, steps: &[Stage], tx: &Sende
             a.stack.mos.cancel.store(true, Ordering::Relaxed);
         }
     } else if stacking_done(a) {
-        // Nothing left to stack: point to what comes next.
+        // Nothing left to stack; the image steps' button is what's next.
+        // A setting, grade or master that changes brings the button back.
         ui.label(RichText::new(format!("Steps 1–{k} are up to date")).font(body(12.0)).color(p.muted));
-        if w::button(ui, p, "Next: make the image", Kind::Primary, None).clicked() {
-            a.stack.stage = Stage::Enhance;
-        }
     } else if let Some(n) = a.stack.plan.as_ref().map(|pl| pl.n_lights()) {
         let (label, enabled) = process_label(n, k, a.stack.pending);
         if w::button_enabled(ui, p, &label, Kind::Primary, None, enabled).clicked() {

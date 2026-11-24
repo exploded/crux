@@ -70,6 +70,9 @@ pub struct ImageUi {
     pub sview: u8,
     pub writing: bool,
     pub written: Option<Result<render::Written, String>>,
+    /// The recipe `written` was made with (`recipe_sig`), so the step
+    /// list can tell whether the settings changed since.
+    written_with: Option<String>,
     save_name: String,
     saved: Option<Vec<(String, PathBuf)>>,
     pub split: f32,
@@ -83,6 +86,8 @@ pub struct ImageUi {
     /// Set by the screenshot harness.
     pub pending_preset: Option<String>,
     pub pending_write: bool,
+    /// Harness: press the step list's Run steps button (`img-run`).
+    pub pending_run: bool,
     pub render_ms: f64,
     /// `[process] fits`: also write a FITS copy.
     fits: bool,
@@ -192,6 +197,7 @@ impl Default for ImageUi {
             sview: 1,
             writing: false,
             written: None,
+            written_with: None,
             save_name: String::new(),
             saved: None,
             split: 0.5,
@@ -201,6 +207,7 @@ impl Default for ImageUi {
             cancel: Arc::new(AtomicBool::new(false)),
             pending_preset: None,
             pending_write: false,
+            pending_run: false,
             render_ms: 0.0,
             fits: false,
             crop_drag: None,
@@ -225,7 +232,7 @@ impl Default for ImageUi {
 
 impl ImageUi {
     pub fn ready_for_shot(&self) -> bool {
-        self.after.is_some() && (self.prep_key.is_empty() || self.preparing.is_none()) && !self.writing && !self.pending_write && !self.view_busy && self.view_pending.is_none() && !self.tiles_busy && self.tiles_pending.is_none() || self.error.is_some()
+        self.after.is_some() && (self.prep_key.is_empty() || self.preparing.is_none()) && !self.writing && !self.pending_write && !self.pending_run && !self.view_busy && self.view_pending.is_none() && !self.tiles_busy && self.tiles_pending.is_none() || self.error.is_some()
     }
 
     /// Preparing, enhancing or writing in the background (files in the
@@ -324,6 +331,12 @@ fn named(r: &Recipe) -> Recipe {
         r.name = if r.mix.preset.is_empty() { "Custom".into() } else { r.mix.preset.clone() };
     }
     r
+}
+
+/// A recipe as written, for comparing (crop and turn included: they change
+/// the file).
+fn recipe_sig(r: &Recipe) -> String {
+    serde_json::to_string(&named(r)).unwrap_or_default()
 }
 
 /// Where the full-size image goes and its file name without extension.
@@ -456,6 +469,7 @@ pub fn load(a: &mut UiState, s: &Session) {
         r.fit_to(&names);
         // Made in an earlier session with these settings: show it as saved.
         img.written = on_disk(&t, &out, &r).map(Ok);
+        img.written_with = img.written.is_some().then(|| recipe_sig(&r));
         img.base = Some((r.clone(), label));
         img.recipe = Some(r);
     }
@@ -675,10 +689,61 @@ fn tick_views(a: &mut UiState, t: &Target, out: &std::path::Path, tx: &Sender<Ms
     }
 }
 
+/// The run button under the image steps (numbered `first`–`last`): makes
+/// the full-size image with the current settings, like Create full-size
+/// image. Once that image is on disk and the settings haven't changed, it
+/// says so instead.
+pub fn run_button(ui: &mut Ui, a: &mut UiState, p: &Pal, first: usize, last: usize, ready: bool, tx: &Sender<Msg>) {
+    let steps = format!("steps {first}–{last}");
+    let small = |ui: &mut Ui, t: String| {
+        ui.add(egui::Label::new(RichText::new(t).font(body(12.0)).color(p.muted)).wrap());
+    };
+    ui.add_space(2.0);
+    let out = a.stack.plan.as_ref().map(|pl| pl.out.clone());
+    let img = &mut a.stack.img;
+    if img.writing {
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new().size(12.0).color(p.accent));
+            small(ui, "Creating the full-size image…".into());
+        });
+        return;
+    }
+    let target = img.target().cloned();
+    let (Some(t), Some(out), true) = (target, out, ready) else {
+        w::button_enabled(ui, p, &format!("Run {steps}"), Kind::Primary, None, false);
+        small(ui, format!("Needs the master lights from steps 1–{}", first - 1));
+        return;
+    };
+    let now = img.recipe.as_ref().map(recipe_sig);
+    match &img.written {
+        Some(Ok(wr)) if now.is_some() && img.written_with == now => {
+            img.pending_run = false;
+            small(ui, format!("Steps {first}–{last} are up to date"));
+            let jpg = wr.jpg.clone();
+            if w::button(ui, p, "Open the image", Kind::Ghost, None).clicked() {
+                let _ = crate::stack::open_folder(&jpg);
+            }
+        }
+        written => {
+            let changed = matches!(written, Some(Ok(_)));
+            if w::button(ui, p, &format!("Run {steps}"), Kind::Primary, None).clicked() || std::mem::take(&mut img.pending_run) {
+                start_write(img, &t, &out, tx, ui.ctx());
+                // From a stacking step, show where the result lands.
+                if !a.stack.stage.is_image() {
+                    a.stack.stage = Stage::Crop;
+                }
+                return;
+            }
+            small(ui, if changed { "Settings changed since the last image".into() } else { "Makes the full-size image with these settings".into() });
+        }
+    }
+}
+
 fn start_write(img: &mut ImageUi, t: &Target, out: &std::path::Path, tx: &Sender<Msg>, ctx: &egui::Context) {
     let Some(r) = img.recipe.as_ref().map(named) else { return };
     img.writing = true;
     img.written = None;
+    img.written_with = Some(recipe_sig(&r));
     let (tx, ctx, t, dir, cancel, fits, out) = (tx.clone(), ctx.clone(), t.clone(), t.image_dir(out), img.cancel.clone(), img.fits, out.to_path_buf());
     std::thread::Builder::new()
         .name("crux-image-write".into())
