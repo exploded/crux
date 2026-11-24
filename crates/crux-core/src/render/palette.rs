@@ -322,15 +322,27 @@ pub fn presets(kind: Kind, channels: &[String]) -> Vec<Preset> {
             let has_h = channels.iter().any(|c| c == "H");
             let has_l = channels.iter().any(|c| c == "L");
             let fin = |lum: f64, sat: f64| Some(Finishing { luminance: lum, green: 0.0, saturation: sat, detail: 0.0, chroma: 0.0, neutral: 0.0 });
-            let mut v = vec![
-                Preset { name: "Natural", weights: rgb.clone(), balance: Balance::Stars, stretch: None, finish: fin(if has_l { 0.8 } else { 0.0 }, 1.2) },
-                Preset { name: "Vivid", weights: rgb.clone(), balance: Balance::Stars, stretch: None, finish: fin(if has_l { 0.8 } else { 0.0 }, 1.6) },
-                Preset { name: "RGB only", weights: rgb.clone(), balance: Balance::Stars, stretch: None, finish: fin(0.0, 1.2) },
-            ];
+            let rgb_preset = |name, stretch, finish| Preset { name, weights: rgb.clone(), balance: Balance::Stars, stretch, finish };
+            let mut v = if has_l {
+                vec![rgb_preset("Natural", None, fin(0.8, 1.2)), rgb_preset("Vivid", None, fin(0.8, 1.6)), rgb_preset("RGB only", None, fin(0.0, 1.2))]
+            } else {
+                // Without L, "RGB only" would be Natural again, and colour
+                // alone barely changes a star field: these differ by
+                // stretch. Each sets its stretch, so going back to Natural
+                // undoes Dark sky.
+                let st = |background: f64, black: f64, highlights: f64| Some(Stretching { background, black, highlights, ..Stretching::default() });
+                vec![
+                    rgb_preset("Natural", st(0.11, 0.0, 0.0), fin(0.0, 1.2)),
+                    rgb_preset("Vivid", st(0.11, 0.0, 0.0), fin(0.0, 1.6)),
+                    rgb_preset("Dark sky", st(0.08, 0.3, 0.0), fin(0.0, 1.2)),
+                    rgb_preset("Faint detail", st(0.18, 0.0, 0.4), fin(0.0, 1.3)),
+                ]
+            };
             if has_h {
                 let mut w = rgb.clone();
                 w.push(("H", [0.5, 0.0, 0.03]));
-                v.insert(1, Preset { name: "Ha + RGB", weights: w, balance: Balance::Stars, stretch: None, finish: fin(if has_l { 0.8 } else { 0.0 }, 1.3) });
+                let stretch = v[0].stretch.clone();
+                v.insert(1, Preset { name: "Ha + RGB", weights: w, balance: Balance::Stars, stretch, finish: fin(if has_l { 0.8 } else { 0.0 }, 1.3) });
             }
             v
         }
@@ -724,6 +736,23 @@ mod tests {
         assert_eq!(canonical("Luminance"), "L");
         assert_eq!(canonical("HA"), "H");
         assert_eq!(kind_of(&["L".into(), "R".into(), "G".into(), "B".into(), "H".into()]), Kind::Broadband);
+    }
+
+    #[test]
+    fn rgb_without_l_offers_presets_that_differ() {
+        let names = |ch: &[&str]| presets(Kind::Broadband, &ch.iter().map(|c| c.to_string()).collect::<Vec<_>>()).iter().map(|p| p.name).collect::<Vec<_>>();
+        assert_eq!(names(&["L", "R", "G", "B"]), ["Natural", "Vivid", "RGB only"]);
+        assert_eq!(names(&["R", "G", "B"]), ["Natural", "Vivid", "Dark sky", "Faint detail"]);
+        assert_eq!(names(&["R", "G", "B", "H"]), ["Natural", "Ha + RGB", "Vivid", "Dark sky", "Faint detail"]);
+        // Each sets its stretch and finishing, and no two are the same.
+        let ch: Vec<String> = ["R", "G", "B", "H"].iter().map(|c| c.to_string()).collect();
+        let pr = presets(Kind::Broadband, &ch);
+        let looks: Vec<_> = pr.iter().map(|p| (format!("{:?}", p.weights), p.stretch.clone().expect("stretch"), p.finish.clone().expect("finish"))).collect();
+        for (i, a) in looks.iter().enumerate() {
+            assert!(looks[i + 1..].iter().all(|b| a != b), "{} repeats another preset", pr[i].name);
+        }
+        // Natural is crux's default stretch, so new recipes don't change.
+        assert_eq!(pr[0].stretch, Some(Stretching::default()));
     }
 
     #[test]
