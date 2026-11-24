@@ -319,18 +319,22 @@ fn graph(ui: &mut Ui, a: &mut UiState, s: &mut Session, p: &Pal) {
         let y = ly(i);
         let r = Rect::from_min_size(Pos2::new(c1, y - 12.0), Vec2::new(lw, 24.0));
         let resp = ui.interact(r, ui.scope_id().with(("calrow", i)), Sense::click());
-        let hover_drop = resp.dnd_hover_payload::<DragFlat>().filter(|d| d.filter == c.filter);
+        // Any set can be dropped: a flat's FILTER can be wrong (the Celestron
+        // Origin writes Clear on flats whatever is in the filter drawer).
+        // Another filter's set is outlined amber and the toast says so.
+        let hover_drop = resp.dnd_hover_payload::<DragFlat>();
+        let other_filter = hover_drop.as_ref().is_some_and(|d| !d.filter.eq_ignore_ascii_case(&c.filter));
+        let drop_col = if other_filter { p.warn } else { p.accent };
         let sel = a.cal.sel_choice == Some(i);
-        let fill = if hover_drop.is_some() { alpha(p.accent, 0.25) } else if sel { alpha(p.accent, 0.14) } else { p.panel2 };
-        pa.rect(r, CornerRadius::same(6), fill, Stroke::new(1.0, if sel || hover_drop.is_some() { p.accent } else { p.line }), StrokeKind::Inside);
+        let fill = if hover_drop.is_some() { alpha(drop_col, 0.25) } else if sel { alpha(p.accent, 0.14) } else { p.panel2 };
+        let stroke = if hover_drop.is_some() { drop_col } else if sel { p.accent } else { p.line };
+        pa.rect(r, CornerRadius::same(6), fill, Stroke::new(1.0, stroke), StrokeKind::Inside);
         let fc = p.filter(&c.filter);
         pa.rect_filled(Rect::from_min_size(Pos2::new(r.left() + 6.0, y - 7.0), Vec2::new(14.0, 14.0)), CornerRadius::same(3), fc);
         pa.text(Pos2::new(r.left() + 13.0, y), egui::Align2::CENTER_CENTER, &c.filter, mono(10.0), p.bg);
         pa.text(Pos2::new(r.left() + 26.0, y), egui::Align2::LEFT_CENTER, format!("{} · {} lights", d_short(c.night), c.n_lights), body(11.5), p.fg);
         if let Some(d) = resp.dnd_release_payload::<DragFlat>() {
-            if d.filter == c.filter {
-                picked = Some((i, (*d).clone()));
-            }
+            picked = Some((i, (*d).clone()));
         }
         let tip = format!("{}{}", c.reason, if c.pinned { "\n\nYour choice. Select the row and press \"Back to crux's choice\" to undo." } else { "" });
         if resp.on_hover_text(tip).clicked() {
@@ -390,7 +394,12 @@ fn graph(ui: &mut Ui, a: &mut UiState, s: &mut Session, p: &Pal) {
     if let Some((i, d)) = picked {
         let c = &choices[i];
         s.pick_flat(&c.filter, c.night, Some((d.library_id.clone(), d.group.clone(), d.night)));
-        a.toast(ui.ctx(), format!("{} lights on {} will use {}. Saved in your decisions; moves and processing use it.", c.filter, d_short(c.night), d.label), false);
+        let warn = if d.filter.eq_ignore_ascii_case(&c.filter) {
+            String::new()
+        } else {
+            format!(" Its filter is {}, not {}: check the corners and dust in the stack.", d.filter, c.filter)
+        };
+        a.toast(ui.ctx(), format!("{} lights on {} will use {}. Saved in your decisions; moves and processing use it.{warn}", c.filter, d_short(c.night), d.label), false);
         a.cal.sel_choice = Some(i);
     }
     // The selected night: crux's reason, and the way back.
