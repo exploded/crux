@@ -4,8 +4,8 @@ crux is an astrophotography image toolkit. It takes a night's raw subs from
 capture software such as N.I.N.A. or an ASIAIR, and goes all the way to a
 finished image. It grades every frame, matches calibration frames, then
 calibrates, registers, integrates, builds mosaics and renders colour images.
-**Status:** in development, used daily on Windows. The tests run on
-Windows, Linux and macOS.
+**Status:** in development, used daily on Windows, and tested on Linux
+(Debian) and macOS (an iMac). The tests run on Windows, Linux and macOS.
 
 ## Download
 
