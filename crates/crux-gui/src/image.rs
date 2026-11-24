@@ -107,11 +107,13 @@ pub struct ImageUi {
     pub pending_turn: bool,
     /// What the background preparation is doing (enhance progress).
     pub progress: Option<String>,
-    /// Sharpen and denoise stage: before and after crops, their key, the
-    /// request in flight, where to look (0 centre, 1 top-left corner), and
-    /// whether each engine can run (crux, RC Astro; checked once).
-    enh_view: Option<(egui::TextureHandle, egui::TextureHandle)>,
-    enh_pending: Option<(String, Result<(render::Rgb, render::Rgb), String>)>,
+    /// Sharpen and denoise stage: before and after crops with the settings
+    /// the after crop shows (the label must name those, not the settings
+    /// still being worked out), their key, the request in flight, where to
+    /// look (0 centre, 1 top-left corner), and whether each engine can run
+    /// (crux, RC Astro; checked once).
+    enh_view: Option<(egui::TextureHandle, egui::TextureHandle, String)>,
+    enh_pending: Option<(String, Result<(render::Rgb, render::Rgb, String), String>)>,
     enh_key: String,
     enh_loading: Option<String>,
     enh_error: Option<String>,
@@ -1452,8 +1454,8 @@ const ENH_CROP: (usize, usize) = (720, 480);
 fn enhance_tick(img: &mut ImageUi, t: &Target, out: &std::path::Path, tx: &Sender<Msg>, ctx: &egui::Context) {
     if let Some((key, r)) = img.enh_pending.take() {
         match r {
-            Ok((b, a)) => {
-                img.enh_view = Some((tex(ctx, "enh-before", &b), tex(ctx, "enh-after", &a)));
+            Ok((b, a, what)) => {
+                img.enh_view = Some((tex(ctx, "enh-before", &b), tex(ctx, "enh-after", &a), what));
                 img.enh_error = None;
             }
             Err(e) => {
@@ -1478,9 +1480,11 @@ fn enhance_tick(img: &mut ImageUi, t: &Target, out: &std::path::Path, tx: &Sende
     std::thread::Builder::new()
         .name("crux-enhance-view".into())
         .spawn(move || {
-            let res = (|| -> anyhow::Result<(render::Rgb, render::Rgb)> {
+            let res = (|| -> anyhow::Result<(render::Rgb, render::Rgb, String)> {
                 let m = &t.masters[ch];
-                let after = if e.active() { render::enhance::cached_path(&t, &out, &e)[ch].clone().unwrap_or_else(|| m.path.clone()) } else { m.path.clone() };
+                let enhanced = if e.active() { render::enhance::cached_path(&t, &out, &e)[ch].clone() } else { None };
+                let what = if enhanced.is_some() { enhance_label(&e) } else { "Off".to_string() };
+                let after = enhanced.unwrap_or_else(|| m.path.clone());
                 let a = crux_core::read_image(&m.path)?;
                 let b = crux_core::read_image(&after)?;
                 anyhow::ensure!((a.width, a.height) == (b.width, b.height), "the enhanced master differs in size");
@@ -1495,7 +1499,7 @@ fn enhance_tick(img: &mut ImageUi, t: &Target, out: &std::path::Path, tx: &Sende
                     let v: Vec<f32> = im.data.iter().map(|x| stf.apply(*x)).collect();
                     render::Rgb { width: im.width, height: im.height, r: v.clone(), g: v.clone(), b: v }
                 };
-                Ok((grey(&ca), grey(&cb)))
+                Ok((grey(&ca), grey(&cb), what))
             })()
             .map_err(|e| format!("{e:#}"));
             let _ = tx.send(Msg::ImageEnhanceView(key, res));
@@ -1509,9 +1513,8 @@ fn enhance_tick(img: &mut ImageUi, t: &Target, out: &std::path::Path, tx: &Sende
 fn enhance_view(ui: &mut Ui, a: &mut UiState, p: &Pal) {
     let wd = ui.available_width();
     let img = &mut a.stack.img;
-    let on = img.recipe.as_ref().is_some_and(|r| r.enhance.active());
     let ready = img.enh_view.clone().filter(|_| img.enh_key.ends_with(&format!("|{}|{}", img.gchan.min(img.target().map(|t| t.masters.len().saturating_sub(1)).unwrap_or(0)), img.ewhere)));
-    let Some((before, after)) = ready else {
+    let Some((before, after, shown)) = ready else {
         let h = (wd * 0.55).min(max_view_h(ui, img, 0.58));
         let (r, _) = ui.allocate_exact_size(Vec2::new(wd, h), Sense::hover());
         ui.painter().rect_filled(r, 10.0, p.well);
@@ -1548,12 +1551,20 @@ fn enhance_view(ui: &mut Ui, a: &mut UiState, p: &Pal) {
         pa.rect_filled(rr, 4.0, Color32::from_black_alpha(140));
         pa.galley(rr.min + Vec2::new(6.0, 2.0), g, Color32::WHITE);
     };
-    let what = img.recipe.as_ref().map(|r| upper_first(&r.enhance.describe())).unwrap_or_default();
-    let ch = img.target().and_then(|t| t.masters.get(img.gchan.min(t.masters.len().saturating_sub(1)))).map(|m| m.channel.clone()).unwrap_or_default();
+    // Name what the after crop really shows: while new settings are being
+    // worked out it's still the previous result.
+    let wanted = img.recipe.as_ref().map(|r| if r.enhance.active() { enhance_label(&r.enhance) } else { "Off".to_string() }).unwrap_or_default();
+    let right = if shown == wanted { shown } else { format!("{shown} · updating…") };
+    let ch =img.target().and_then(|t| t.masters.get(img.gchan.min(t.masters.len().saturating_sub(1)))).map(|m| m.channel.clone()).unwrap_or_default();
     let place = if img.ewhere == 1 { "top-left corner" } else { "centre" };
     lab(r.left_top() + Vec2::new(8.0, 8.0), egui::Align2::LEFT_TOP, "Original");
-    lab(r.right_top() + Vec2::new(-8.0, 8.0), egui::Align2::RIGHT_TOP, if on { &what } else { "Off" });
+    lab(r.right_top() + Vec2::new(-8.0, 8.0), egui::Align2::RIGHT_TOP, &right);
     lab(r.left_bottom() + Vec2::new(8.0, -8.0), egui::Align2::LEFT_BOTTOM, &format!("{ch} · 1:1, {place} · {tw} × {th} px · one stretch"));
+}
+
+/// The after crop's label: "Sharpen 100%, denoise 80% (RC Astro)".
+fn enhance_label(e: &render::enhance::EnhanceSettings) -> String {
+    upper_first(&e.describe())
 }
 
 /// Settings for the Sharpen and denoise stage.

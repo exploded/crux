@@ -79,8 +79,9 @@ pub enum Msg {
     ImageWritten(Result<crux_core::render::Written, String>),
     /// Image stage: what the background preparation is doing.
     ImageProgress(String),
-    /// Sharpen and denoise stage: before and after crops (key, result).
-    ImageEnhanceView(String, Result<(crux_core::render::Rgb, crux_core::render::Rgb), String>),
+    /// Sharpen and denoise stage: before and after crops and the settings
+    /// the after crop was made with (key, result).
+    ImageEnhanceView(String, Result<(crux_core::render::Rgb, crux_core::render::Rgb, String), String>),
     /// Image stages: the preview rendered in the background (key, before,
     /// after, labels, milliseconds), and the preset tiles (key, tiles).
     ImageView(Box<crate::image::ViewDone>),
